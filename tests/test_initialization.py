@@ -3,11 +3,11 @@
 import pytest
 import torch
 
-from kvpress.initialization import (
+from cacheshrink.initialization import (
     balanced_svd_init,
     init_compression_from_calibration,
 )
-from kvpress.utils import check_orthonormality
+from cacheshrink.utils import check_orthonormality
 
 
 class TestBalancedSVDInit:

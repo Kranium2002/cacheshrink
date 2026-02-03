@@ -138,11 +138,11 @@ jobs:
           tag_name: v${{ needs.check-version.outputs.version }}
           name: Release v${{ needs.check-version.outputs.version }}
           body: |
-            ## kvpress v${{ needs.check-version.outputs.version }}
+            ## cacheshrink v${{ needs.check-version.outputs.version }}
 
             ### Installation
             ```bash
-            pip install kvpress==${{ needs.check-version.outputs.version }}
+            pip install cacheshrink==${{ needs.check-version.outputs.version }}
             ```
 
             ### Changes

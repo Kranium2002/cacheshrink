@@ -22,7 +22,7 @@ class TestFullPipeline:
 
     def test_convert_generate_save_load(self, model_name, device):
         """Test full pipeline: convert -> generate -> save -> load -> generate."""
-        from kvpress import convert_to_mla, save_mla_model, load_mla_model
+        from cacheshrink import convert_to_mla, save_mla_model, load_mla_model
 
         # Convert
         model, tokenizer = convert_to_mla(
@@ -83,7 +83,7 @@ class TestFullPipeline:
 
     def test_kv_cache_compression(self, model_name, device):
         """Test that KV cache is actually compressed."""
-        from kvpress import convert_to_mla, measure_cache_memory
+        from cacheshrink import convert_to_mla, measure_cache_memory
 
         model, tokenizer = convert_to_mla(
             model_name,
@@ -114,7 +114,7 @@ class TestOrthonormalityPreservation:
 
     def test_orthonormality_after_forward(self, model_name, device):
         """Test orthonormality is maintained after forward passes."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         model, tokenizer = convert_to_mla(
             model_name,
@@ -155,7 +155,7 @@ class TestEvaluation:
 
     def test_compute_perplexity(self, model_name, device):
         """Test perplexity computation."""
-        from kvpress import convert_to_mla, compute_perplexity
+        from cacheshrink import convert_to_mla, compute_perplexity
 
         model, tokenizer = convert_to_mla(
             model_name,
@@ -187,7 +187,7 @@ class TestEvaluation:
 
     def test_generate_samples(self, model_name, device):
         """Test sample generation."""
-        from kvpress import convert_to_mla, generate_samples
+        from cacheshrink import convert_to_mla, generate_samples
 
         model, tokenizer = convert_to_mla(
             model_name,
@@ -224,7 +224,7 @@ class TestMLATrainer:
 
     def test_trainer_initialization(self, model_name, device):
         """Test trainer can be initialized."""
-        from kvpress import convert_to_mla, MLATrainer
+        from cacheshrink import convert_to_mla, MLATrainer
 
         model, tokenizer = convert_to_mla(
             model_name,
@@ -246,7 +246,7 @@ class TestMLATrainer:
 
     def test_trainer_freezes_correct_params(self, model_name, device):
         """Test that trainer freezes non-MLA parameters."""
-        from kvpress import convert_to_mla, MLATrainer
+        from cacheshrink import convert_to_mla, MLATrainer
 
         model, tokenizer = convert_to_mla(
             model_name,
@@ -268,7 +268,7 @@ class TestMLATrainer:
     @pytest.mark.slow
     def test_trainer_one_step(self, model_name, device):
         """Test that trainer can do one training step."""
-        from kvpress import convert_to_mla, MLATrainer
+        from cacheshrink import convert_to_mla, MLATrainer
 
         model, tokenizer = convert_to_mla(
             model_name,

@@ -3,14 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kvpress"
+name = "cacheshrink"
 version = "0.1.0"
 description = "KV Cache Compression via Multi-Head Latent Attention with Riemannian Optimization"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 authors = [
-    {name = "kvpress contributors"}
+    {name = "cacheshrink contributors"}
 ]
 keywords = ["transformers", "attention", "compression", "kv-cache", "riemannian", "mla", "llm", "inference"]
 classifiers = [
@@ -43,13 +43,13 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kvpress/kvpress"
-Documentation = "https://github.com/kvpress/kvpress#readme"
-Repository = "https://github.com/kvpress/kvpress"
-Issues = "https://github.com/kvpress/kvpress/issues"
+Homepage = "https://github.com/cacheshrink/cacheshrink"
+Documentation = "https://github.com/cacheshrink/cacheshrink#readme"
+Repository = "https://github.com/cacheshrink/cacheshrink"
+Issues = "https://github.com/cacheshrink/cacheshrink/issues"
 
 [tool.setuptools.packages.find]
-include = ["kvpress*"]
+include = ["cacheshrink*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

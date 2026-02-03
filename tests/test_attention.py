@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from kvpress.attention import (
+from cacheshrink.attention import (
     MLAAttention,
     RotaryEmbedding,
     rotate_half,

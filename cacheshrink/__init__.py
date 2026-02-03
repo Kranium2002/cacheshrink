@@ -1,4 +1,4 @@
-"""kvpress: KV Cache Compression via Multi-Head Latent Attention.
+"""cacheshrink: KV Cache Compression via Multi-Head Latent Attention.
 
 This library converts HuggingFace transformer models to use Multi-Head Latent
 Attention (MLA) for KV cache compression. The compression matrices are
@@ -7,7 +7,7 @@ Riemannian gradient descent.
 
 Example usage:
 
-    from kvpress import convert_to_mla, save_mla_model, load_mla_model
+    from cacheshrink import convert_to_mla, save_mla_model, load_mla_model
 
     # Convert a model
     model, tokenizer = convert_to_mla("gpt2", compression_ratio=4)

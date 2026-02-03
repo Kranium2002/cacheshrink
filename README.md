@@ -1,4 +1,4 @@
-# kvpress
+# cacheshrink
 
 **KV Cache Compression via Multi-Head Latent Attention with Riemannian Optimization**
 
@@ -6,7 +6,7 @@ Achieve **4-16x KV cache compression** on LLaMA, Mistral, GPT-2, and other trans
 
 ## Overview
 
-`kvpress` converts HuggingFace transformer models to use **Multi-Head Latent Attention (MLA)**, dramatically reducing KV cache memory during inference. The library uses **Riemannian optimization on Stiefel manifolds** to ensure orthonormality constraints are preserved during fine-tuning, enabling high compression ratios with minimal quality loss.
+`cacheshrink` converts HuggingFace transformer models to use **Multi-Head Latent Attention (MLA)**, dramatically reducing KV cache memory during inference. The library uses **Riemannian optimization on Stiefel manifolds** to ensure orthonormality constraints are preserved during fine-tuning, enabling high compression ratios with minimal quality loss.
 
 ### Key Features
 
@@ -87,11 +87,11 @@ Example (LLaMA-2 7B with 4x compression):
 ## Installation
 
 ```bash
-pip install kvpress
+pip install cacheshrink
 
 # For development
-git clone https://github.com/your-repo/kvpress
-cd kvpress
+git clone https://github.com/your-repo/cacheshrink
+cd cacheshrink
 pip install -e ".[dev]"
 ```
 
@@ -107,7 +107,7 @@ pip install -e ".[dev]"
 ### Basic Conversion
 
 ```python
-from kvpress import convert_to_mla, save_mla_model, load_mla_model
+from cacheshrink import convert_to_mla, save_mla_model, load_mla_model
 
 # Convert a HuggingFace model to MLA with 4x compression
 model, tokenizer = convert_to_mla(
@@ -151,7 +151,7 @@ model, tokenizer = convert_to_mla(
 For best results, fine-tune the compressed model using knowledge distillation:
 
 ```python
-from kvpress import MLATrainer
+from cacheshrink import MLATrainer
 from transformers import AutoModelForCausalLM
 
 # Load original model as teacher
@@ -183,7 +183,7 @@ trainer.train(
 ### Evaluation
 
 ```python
-from kvpress import compute_perplexity, measure_cache_memory
+from cacheshrink import compute_perplexity, measure_cache_memory
 
 # Measure perplexity
 ppl = compute_perplexity(model, tokenizer, eval_texts, max_length=512)
@@ -231,7 +231,7 @@ for seq_len, info in stats['per_sequence_length'].items():
 Extend `ModelHandler` to support additional architectures:
 
 ```python
-from kvpress import ModelHandler, register_handler
+from cacheshrink import ModelHandler, register_handler
 
 class MyModelHandler(ModelHandler):
     def get_num_layers(self) -> int:
@@ -310,7 +310,7 @@ MLAConfig(
 ### Custom Initialization
 
 ```python
-from kvpress import balanced_svd_init, MLACompression
+from cacheshrink import balanced_svd_init, MLACompression
 
 # Manual SVD initialization
 W_down_k, W_down_v, W_uk, W_uv = balanced_svd_init(
@@ -337,7 +337,7 @@ for layer_idx in range(model.mla_config.n_layers):
 ### Training Configuration
 
 ```python
-from kvpress import TrainingConfig
+from cacheshrink import TrainingConfig
 
 config = TrainingConfig(
     euclidean_lr=1e-5,
@@ -356,7 +356,7 @@ config = TrainingConfig(
 
 ### Two-Optimizer Approach
 
-kvpress uses separate optimizers for different parameter types:
+cacheshrink uses separate optimizers for different parameter types:
 
 1. **AdamW** for Euclidean parameters (`W_down_k`, `W_down_v`)
    - Standard gradient descent
@@ -385,13 +385,13 @@ This keeps the compressed model's behavior close to the original.
 
 ## Citation
 
-If you use kvpress in your research, please cite:
+If you use cacheshrink in your research, please cite:
 
 ```bibtex
-@software{kvpress2024,
-  title = {kvpress: KV Cache Compression via Multi-Head Latent Attention},
+@software{cacheshrink2024,
+  title = {cacheshrink: KV Cache Compression via Multi-Head Latent Attention},
   year = {2024},
-  url = {https://github.com/your-repo/kvpress}
+  url = {https://github.com/your-repo/cacheshrink}
 }
 ```
 

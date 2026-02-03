@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from kvpress.model_handlers import (
+from cacheshrink.model_handlers import (
     get_handler,
     get_attention_adapter,
     GPT2Handler,
@@ -35,8 +35,8 @@ class TestHandlerRegistry:
 
     def test_get_attention_adapter(self):
         """Test getting attention adapter by model type."""
-        from kvpress.model_handlers.gpt2 import GPT2AttentionAdapter
-        from kvpress.model_handlers.llama import LlamaAttentionAdapter
+        from cacheshrink.model_handlers.gpt2 import GPT2AttentionAdapter
+        from cacheshrink.model_handlers.llama import LlamaAttentionAdapter
 
         assert get_attention_adapter("gpt2") == GPT2AttentionAdapter
         assert get_attention_adapter("llama") == LlamaAttentionAdapter
@@ -146,8 +146,8 @@ class TestGPT2AttentionAdapter:
 
     def test_forward_signature(self, gpt2_config, device, dtype):
         """Test that adapter has correct forward signature."""
-        from kvpress.attention import MLAAttention
-        from kvpress.model_handlers.gpt2 import GPT2AttentionAdapter
+        from cacheshrink.attention import MLAAttention
+        from cacheshrink.model_handlers.gpt2 import GPT2AttentionAdapter
 
         mla_attn = MLAAttention(gpt2_config).to(device, dtype)
         adapter = GPT2AttentionAdapter(mla_attn)
@@ -169,8 +169,8 @@ class TestGPT2AttentionAdapter:
 
     def test_forward_with_cache(self, gpt2_config, device, dtype):
         """Test adapter with caching."""
-        from kvpress.attention import MLAAttention
-        from kvpress.model_handlers.gpt2 import GPT2AttentionAdapter
+        from cacheshrink.attention import MLAAttention
+        from cacheshrink.model_handlers.gpt2 import GPT2AttentionAdapter
 
         mla_attn = MLAAttention(gpt2_config).to(device, dtype)
         adapter = GPT2AttentionAdapter(mla_attn)
@@ -190,8 +190,8 @@ class TestLlamaAttentionAdapter:
 
     def test_forward_signature(self, llama_config, device, dtype):
         """Test that adapter has correct forward signature."""
-        from kvpress.attention import MLAAttention
-        from kvpress.model_handlers.llama import LlamaAttentionAdapter
+        from cacheshrink.attention import MLAAttention
+        from cacheshrink.model_handlers.llama import LlamaAttentionAdapter
 
         mla_attn = MLAAttention(llama_config).to(device, dtype)
         adapter = LlamaAttentionAdapter(mla_attn, llama_config)

@@ -20,7 +20,7 @@ class TestConvertToMLA:
 
     def test_convert_gpt2_basic(self, small_model_name, device):
         """Test basic conversion of GPT-2."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         # Convert with minimal calibration
         model, tokenizer = convert_to_mla(
@@ -42,7 +42,7 @@ class TestConvertToMLA:
 
     def test_converted_model_generates(self, small_model_name, device):
         """Test that converted model can generate text."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         model, tokenizer = convert_to_mla(
             small_model_name,
@@ -71,7 +71,7 @@ class TestConvertToMLA:
 
     def test_converted_model_orthonormality(self, small_model_name, device):
         """Test that converted model maintains orthonormality."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         model, tokenizer = convert_to_mla(
             small_model_name,
@@ -92,7 +92,7 @@ class TestConvertToMLA:
 
     def test_compression_ratio_affects_latent_dim(self, small_model_name, device):
         """Test that different compression ratios produce different latent dimensions."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         model_4x, _ = convert_to_mla(
             small_model_name,
@@ -114,7 +114,7 @@ class TestConvertToMLA:
 
     def test_explicit_d_latent(self, small_model_name, device):
         """Test explicit d_latent override."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         model, _ = convert_to_mla(
             small_model_name,
@@ -138,7 +138,7 @@ class TestConversionWithCalibration:
     @pytest.mark.slow
     def test_convert_with_calibration(self, small_model_name, device):
         """Test conversion with calibration data collection."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         # Use minimal calibration
         model, tokenizer = convert_to_mla(
@@ -166,7 +166,7 @@ class TestConversionWithCalibration:
 
     def test_convert_with_custom_texts(self, small_model_name, device):
         """Test conversion with custom calibration texts."""
-        from kvpress import convert_to_mla
+        from cacheshrink import convert_to_mla
 
         custom_texts = [
             "This is a test sentence for calibration.",

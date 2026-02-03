@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from kvpress.compression import MLACompression
-from kvpress.utils import check_orthonormality
+from cacheshrink.compression import MLACompression
+from cacheshrink.utils import check_orthonormality
 
 
 class TestMLACompression:

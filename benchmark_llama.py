@@ -5,7 +5,7 @@ import torch
 import gc
 from datasets import load_dataset
 
-from kvpress import (
+from cacheshrink import (
     convert_to_mla,
     save_mla_model,
     load_mla_model,
@@ -14,7 +14,7 @@ from kvpress import (
     measure_cache_memory,
     generate_samples,
 )
-from kvpress.evaluation import compare_outputs
+from cacheshrink.evaluation import compare_outputs
 
 
 def format_memory(bytes_val):

@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from kvpress.config import MLAConfig
+from cacheshrink.config import MLAConfig
 
 
 @pytest.fixture

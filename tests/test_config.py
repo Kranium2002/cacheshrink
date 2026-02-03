@@ -5,7 +5,7 @@ import json
 import tempfile
 import os
 
-from kvpress.config import MLAConfig
+from cacheshrink.config import MLAConfig
 
 
 class TestMLAConfig:
