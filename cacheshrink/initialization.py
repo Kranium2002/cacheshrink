@@ -107,20 +107,8 @@ def balanced_svd_init(
     device = W_k.device
     dtype = W_k.dtype
 
-    # Check compression quality and warn if too aggressive
-    quality = analyze_compression_quality(W_k, W_v, d_latent)
-    if quality["v_energy"] < 0.90:
-        warnings.warn(
-            f"Aggressive compression detected! Value projection only captures {quality['v_energy']*100:.1f}% "
-            f"of energy with d_latent={d_latent}. This will likely cause poor reconstruction. "
-            f"Consider using a smaller compression_ratio (larger d_latent). "
-            f"Recommended: d_latent >= {compute_optimal_d_latent(W_v, 0.90)[0]} for 90% energy."
-        )
-    elif quality["v_energy"] < 0.95:
-        warnings.warn(
-            f"Value projection captures only {quality['v_energy']*100:.1f}% of energy with d_latent={d_latent}. "
-            f"Consider using compression_ratio=2.0 for better quality."
-        )
+    # Analyze weight-only SVD quality (for reference)
+    weight_quality = analyze_compression_quality(W_k, W_v, d_latent)
 
     # SVD requires float32
     compute_dtype = torch.float32 if dtype == torch.float16 or dtype == torch.bfloat16 else dtype
@@ -137,13 +125,28 @@ def balanced_svd_init(
             max_samples=min(10000, calibration_data.size(0))
         )
 
-        # Log improvement (calibration typically captures 10-20% more energy)
-        if stats["v_energy"] > quality["v_energy"] + 0.05:
-            print(f"  Calibration-aware SVD improved V energy: {quality['v_energy']*100:.1f}% -> {stats['v_energy']*100:.1f}%")
+        # Log improvement (calibration typically captures more energy than weight-only SVD)
+        final_v_energy = stats["v_energy"]
+        print(f"  V energy: {weight_quality['v_energy']*100:.1f}% (weight SVD) -> {final_v_energy*100:.1f}% (calibration SVD)")
+
+        # Warn based on FINAL energy after calibration
+        if final_v_energy < 0.80:
+            warnings.warn(
+                f"Low energy retention after calibration-aware SVD: {final_v_energy*100:.1f}%. "
+                f"Consider using a smaller compression_ratio (larger d_latent) for better quality."
+            )
 
         return W_down_k.to(dtype), W_down_v.to(dtype), W_uk.to(dtype), W_uv.to(dtype)
 
-    # Fallback to weight-only SVD
+    # Fallback to weight-only SVD (no calibration data)
+    # Warn if energy retention is low (only for weight-only SVD path)
+    if weight_quality["v_energy"] < 0.90:
+        warnings.warn(
+            f"Aggressive compression detected! Value projection only captures {weight_quality['v_energy']*100:.1f}% "
+            f"of energy with d_latent={d_latent}. Consider using calibration data or a smaller compression_ratio. "
+            f"Recommended: d_latent >= {compute_optimal_d_latent(W_v, 0.90)[0]} for 90% energy."
+        )
+
     # SVD of W_k: W_k = U_k @ S_k @ Vh_k
     if use_randomized_svd:
         U_k, S_k, _ = randomized_svd(W_k_f32, d_latent, n_oversamples=svd_oversamples, n_power_iterations=svd_power_iterations)

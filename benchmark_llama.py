@@ -43,10 +43,10 @@ def main():
     DEVICE = "cuda"
     DTYPE = torch.float16
 
-    # Dataset config - reduced for 7B model to fit in memory
-    EVAL_SAMPLES = 50   # For perplexity evaluation
-    TRAIN_SAMPLES = 100  # Reduced for 7B (memory constraints)
-    MAX_LENGTH = 256    # Shorter sequences for memory
+    # Dataset config
+    EVAL_SAMPLES = 100   # For perplexity evaluation
+    TRAIN_SAMPLES = 1000  # More training data for better convergence
+    MAX_LENGTH = 512     # Longer sequences for better learning
 
     print(f"\nConfiguration:")
     print(f"  Model: {MODEL_NAME}")
@@ -136,14 +136,16 @@ def main():
     torch.cuda.empty_cache()
     print(f"GPU memory after cleanup: {get_gpu_memory():.2f} GB")
 
-    # Try to load existing converted model first
-    MLA_MODEL_PATH = "./llama-7b-mla-16x"
-
+    # Model paths - separate for converted (SVD only) and trained
     import os
-    if os.path.exists(MLA_MODEL_PATH):
-        print(f"Loading existing MLA model from {MLA_MODEL_PATH}...")
+    MLA_CONVERTED_PATH = "./llama-7b-mla-16x-converted"
+    MLA_TRAINED_PATH = "./llama-7b-mla-16x-trained"
+
+    # Always load converted model (not trained) to ensure consistent training
+    if os.path.exists(MLA_CONVERTED_PATH):
+        print(f"Loading existing converted model from {MLA_CONVERTED_PATH}...")
         start_time = time.time()
-        mla_model, tokenizer = load_mla_model(MLA_MODEL_PATH, device=DEVICE, dtype=DTYPE)
+        mla_model, tokenizer = load_mla_model(MLA_CONVERTED_PATH, device=DEVICE, dtype=DTYPE)
         conversion_time = time.time() - start_time
         print(f"  Load time: {conversion_time:.1f}s")
     else:
@@ -157,13 +159,17 @@ def main():
             use_calibration=True,
             calibration_dataset="wikitext",
             calibration_config="wikitext-2-raw-v1",
-            num_calibration_samples=128,  # More calibration samples
-            max_calibration_length=512,   # Longer sequences
+            num_calibration_samples=256,  # More calibration samples
+            max_calibration_length=1024,  # Longer sequences for better SVD
             use_randomized_svd=False,  # Full SVD is more stable
             verbose=True,
         )
         conversion_time = time.time() - start_time
         print(f"\n  Conversion time: {conversion_time:.1f}s")
+
+        # Save converted model (before training)
+        print(f"\nSaving converted model to {MLA_CONVERTED_PATH}...")
+        save_mla_model(mla_model, tokenizer, MLA_CONVERTED_PATH)
 
     print(f"  GPU memory after loading: {get_gpu_memory():.2f} GB")
 
@@ -234,8 +240,8 @@ def main():
     start_time = time.time()
     training_stats = trainer.train(
         train_texts,
-        num_epochs=10,  # Fewer epochs with distillation
-        batch_size=4,
+        num_epochs=40,
+        batch_size=4,  # Reduced for longer sequences
         max_length=MAX_LENGTH,
     )
     train_time = time.time() - start_time
@@ -340,12 +346,11 @@ ORTHONORMALITY:
 """)
 
     # =========================================================================
-    # Save model
+    # Save trained model
     # =========================================================================
-    if not os.path.exists(MLA_MODEL_PATH):
-        print("Saving MLA model...")
-        save_mla_model(mla_model, tokenizer, MLA_MODEL_PATH)
-        print(f"Model saved to {MLA_MODEL_PATH}")
+    print(f"Saving trained model to {MLA_TRAINED_PATH}...")
+    save_mla_model(mla_model, tokenizer, MLA_TRAINED_PATH)
+    print(f"Model saved to {MLA_TRAINED_PATH}")
 
     print("\nBenchmark complete!")
 

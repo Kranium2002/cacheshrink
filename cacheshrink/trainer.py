@@ -50,9 +50,9 @@ class TrainingConfig:
 
     # Logging and saving
     logging_steps: int = 10
-    save_steps: int = 500
-    save_total_limit: int = 3
-    output_dir: str = "./mla_output"
+    save_steps: int = 0  # 0 = disabled, set to e.g. 1000 to save every 1000 steps
+    save_total_limit: int = 2  # Keep only last N checkpoints
+    output_dir: str = "./mla_checkpoints"
 
     # Orthonormality monitoring
     check_orthonormality_steps: int = 100
@@ -151,6 +151,7 @@ class MLATrainer:
         riemannian_lr: float = 1e-4,
         teacher_model: Optional[nn.Module] = None,
         use_distillation: bool = True,
+        save_steps: int = 0,
     ):
         """Initialize trainer.
 
@@ -163,6 +164,7 @@ class MLATrainer:
             teacher_model: Original (non-MLA) model for distillation. If None and
                 use_distillation=True, will load from mla_config.model_name
             use_distillation: Whether to use knowledge distillation (RECOMMENDED)
+            save_steps: Save checkpoint every N steps (0 = disabled)
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -172,6 +174,7 @@ class MLATrainer:
                 euclidean_lr=euclidean_lr,
                 riemannian_lr=riemannian_lr,
                 use_distillation=use_distillation,
+                save_steps=save_steps,
             )
         self.config = config
 
