@@ -1,4 +1,4 @@
-"""Benchmark LLaMA 2 7B with MLA conversion, training, and evaluation."""
+"""Benchmark Qwen model with MLA conversion, training, and evaluation."""
 
 import time
 import torch
@@ -14,7 +14,6 @@ from cacheshrink import (
     measure_cache_memory,
     generate_samples,
 )
-from cacheshrink.evaluation import compare_outputs
 
 
 def format_memory(bytes_val):
@@ -35,18 +34,21 @@ def get_gpu_memory():
 
 def main():
     print("=" * 70)
-    print("LLaMA 2 7B MLA Benchmark")
+    print("Qwen MLA Benchmark")
     print("=" * 70)
 
-    MODEL_NAME = "NousResearch/Llama-2-7b-hf"  # Open LLaMA 7B (no auth needed)
+    # Qwen models available (no auth needed):
+    # - Qwen/Qwen2.5-0.5B, Qwen/Qwen2.5-1.5B, Qwen/Qwen2.5-3B, Qwen/Qwen2.5-7B
+    # - Qwen/Qwen2-0.5B, Qwen/Qwen2-1.5B, Qwen/Qwen2-7B
+    MODEL_NAME = "Qwen/Qwen2.5-7B"
     COMPRESSION_RATIO = 16.0
     DEVICE = "cuda"
     DTYPE = torch.float16
 
     # Dataset config
-    EVAL_SAMPLES = 100   # For perplexity evaluation
-    TRAIN_SAMPLES = 1000  # More training data for better convergence
-    MAX_LENGTH = 512     # Longer sequences for better learning
+    EVAL_SAMPLES = 100
+    TRAIN_SAMPLES = 1000
+    MAX_LENGTH = 512
 
     print(f"\nConfiguration:")
     print(f"  Model: {MODEL_NAME}")
@@ -72,7 +74,7 @@ def main():
     # Step 1: Load original model and measure baseline perplexity
     # =========================================================================
     print("\n" + "=" * 70)
-    print("Step 1: Loading original LLaMA 2 7B model...")
+    print("Step 1: Loading original Qwen model...")
     print("=" * 70)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -90,6 +92,18 @@ def main():
     load_time = time.time() - start_time
     print(f"  Load time: {load_time:.1f}s")
     print(f"  GPU memory: {get_gpu_memory():.2f} GB")
+
+    # Print attention config
+    hf_config = original_model.config
+    n_heads = hf_config.num_attention_heads
+    n_kv_heads = getattr(hf_config, 'num_key_value_heads', n_heads)
+    print(f"\n  Attention Configuration:")
+    print(f"    Query heads (n_heads): {n_heads}")
+    print(f"    KV heads (n_kv_heads): {n_kv_heads}")
+    if n_kv_heads < n_heads:
+        print(f"    Type: GQA ({n_heads // n_kv_heads}x repetition)")
+    else:
+        print(f"    Type: MHA (standard)")
 
     # Baseline perplexity
     print("\nComputing baseline perplexity...")
@@ -109,7 +123,6 @@ def main():
         "In machine learning, attention mechanisms",
         "The capital of France is",
     ]
-    # Set pad token to avoid warning
     if tokenizer.pad_token_id == tokenizer.eos_token_id:
         original_model.generation_config.pad_token_id = tokenizer.eos_token_id
     baseline_generations = generate_samples(
@@ -129,19 +142,19 @@ def main():
     print("Step 2: Loading/Converting to MLA...")
     print("=" * 70)
 
-    # Clear memory - delete original model first
+    # Clear memory
     print("Freeing original model memory...")
     del original_model
     gc.collect()
     torch.cuda.empty_cache()
     print(f"GPU memory after cleanup: {get_gpu_memory():.2f} GB")
 
-    # Model paths - separate for converted (SVD only) and trained
+    # Model paths
     import os
-    MLA_CONVERTED_PATH = "./llama-7b-mla-16x-converted"
-    MLA_TRAINED_PATH = "./llama-7b-mla-16x-trained"
+    model_short_name = MODEL_NAME.split("/")[-1].lower()
+    MLA_CONVERTED_PATH = f"./{model_short_name}-mla-{int(COMPRESSION_RATIO)}x-converted"
+    MLA_TRAINED_PATH = f"./{model_short_name}-mla-{int(COMPRESSION_RATIO)}x-trained"
 
-    # Always load converted model (not trained) to ensure consistent training
     if os.path.exists(MLA_CONVERTED_PATH):
         print(f"Loading existing converted model from {MLA_CONVERTED_PATH}...")
         start_time = time.time()
@@ -159,15 +172,14 @@ def main():
             use_calibration=True,
             calibration_dataset="wikitext",
             calibration_config="wikitext-2-raw-v1",
-            num_calibration_samples=256,  # More calibration samples
-            max_calibration_length=1024,  # Longer sequences for better SVD
-            use_randomized_svd=False,  # Full SVD is more stable
+            num_calibration_samples=256,
+            max_calibration_length=1024,
+            use_randomized_svd=False,
             verbose=True,
         )
         conversion_time = time.time() - start_time
         print(f"\n  Conversion time: {conversion_time:.1f}s")
 
-        # Save converted model (before training)
         print(f"\nSaving converted model to {MLA_CONVERTED_PATH}...")
         save_mla_model(mla_model, tokenizer, MLA_CONVERTED_PATH)
 
@@ -213,14 +225,14 @@ def main():
     print(f"  Evaluation time: {ppl_time:.1f}s")
 
     # =========================================================================
-    # Step 5: Fine-tune with Riemannian optimization + DISTILLATION
+    # Step 5: Fine-tune with Riemannian optimization + KL-guided loss
     # =========================================================================
     print("\n" + "=" * 70)
-    print("Step 5: Fine-tuning with Riemannian optimization + Knowledge Distillation")
+    print("Step 5: Fine-tuning with Riemannian optimization + KL-guided loss")
     print("=" * 70)
 
-    # Reload original model as teacher for distillation
-    print("Loading teacher model for distillation...")
+    # Reload original model as teacher
+    print("Loading teacher model for KL-guided training...")
     teacher_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=DTYPE,
@@ -231,17 +243,17 @@ def main():
     trainer = MLATrainer(
         model=mla_model,
         tokenizer=tokenizer,
-        teacher_model=teacher_model,  # Use original model as teacher
-        euclidean_lr=1e-5,  # Lower LR for stability
-        riemannian_lr=1e-4,  # Lower LR for Riemannian params
-        use_distillation=True,  # Enable distillation
+        teacher_model=teacher_model,
+        euclidean_lr=1e-5,
+        riemannian_lr=1e-4,
+        use_distillation=True,
     )
 
     start_time = time.time()
     training_stats = trainer.train(
         train_texts,
         num_epochs=40,
-        batch_size=2,  # Reduced for longer sequences
+        batch_size=4,
         max_length=MAX_LENGTH,
     )
     train_time = time.time() - start_time
@@ -281,7 +293,6 @@ def main():
         max_new_tokens=50, temperature=0.7
     )
 
-    # Set pad token for MLA model too
     if tokenizer.pad_token_id == tokenizer.eos_token_id:
         mla_model.generation_config.pad_token_id = tokenizer.eos_token_id
 
