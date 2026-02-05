@@ -472,7 +472,7 @@ where:
   Reconstruction_loss = MSE(K_reconstructed, K_original) + MSE(V_reconstructed, V_original)
   K_original = hidden_states @ W_k_original.T  (stored during conversion)
   K_reconstructed = decompress_k(compress(hidden_states))
-  α = reconstruction weight (default 0.1)
+  α = reconstruction weight (default 0.3)
 ```
 
 **Advantages:**
