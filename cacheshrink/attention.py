@@ -1,7 +1,7 @@
 """MLA Attention module with compressed KV cache."""
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -161,6 +161,11 @@ class MLAAttention(nn.Module):
     4. Stores only c_kv in the KV cache (d_latent instead of 2*d_kv)
     5. Supports both MHA and GQA
 
+    Supports three compression methods:
+    - "separate": Separate K/V compression (default, best quality)
+    - "joint": Joint K/V with shared latent (2x more compression)
+    - "decoupled_rope": Decoupled RoPE (preserves positional info)
+
     RoPE is applied after decompression to match original model behavior.
     """
 
@@ -168,16 +173,21 @@ class MLAAttention(nn.Module):
         self,
         config: MLAConfig,
         layer_idx: int = 0,
+        compression_method: str = "separate",
+        d_rope: int = 64,
     ):
         """Initialize MLA attention.
 
         Args:
             config: MLA configuration
             layer_idx: Layer index (for cache)
+            compression_method: "separate", "joint", or "decoupled_rope"
+            d_rope: RoPE dimension for decoupled_rope method
         """
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.compression_method = compression_method
 
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
@@ -193,8 +203,22 @@ class MLAAttention(nn.Module):
             bias=config.use_bias,
         )
 
-        # MLA compression module
-        self.mla_compression = MLACompression(config)
+        # MLA compression module - depends on method
+        if compression_method == "separate":
+            self.mla_compression = MLACompression(config)
+        elif compression_method == "joint":
+            from .improved_compression import JointKVCompression
+            self.mla_compression = JointKVCompression(config)
+        elif compression_method == "decoupled_rope":
+            from .improved_compression import DecoupledRoPECompression
+            self.mla_compression = DecoupledRoPECompression(
+                d_model=config.d_model,
+                d_kv=config.d_kv,
+                d_latent=config.computed_d_latent,
+                d_rope=d_rope,
+            )
+        else:
+            raise ValueError(f"Unknown compression_method: {compression_method}")
 
         # Output projection
         self.o_proj = nn.Linear(

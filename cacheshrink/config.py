@@ -46,6 +46,10 @@ class MLAConfig:
     # Additional model-specific attributes
     extra_config: Dict[str, Any] = field(default_factory=dict)
 
+    # Compression method (set by converter, affects d_latent calculation)
+    compression_method: str = "separate"
+    d_rope: int = 64  # RoPE dimension for decoupled_rope method
+
     @property
     def d_kv(self) -> int:
         """Total KV dimension: n_kv_heads × d_head."""
@@ -55,18 +59,41 @@ class MLAConfig:
     def computed_d_latent(self) -> int:
         """Compute d_latent from compression ratio if not specified.
 
-        With separate compression for K and V:
+        The formula depends on the compression method:
+
+        Separate K/V compression:
         - Cache stores c_k (d_latent) + c_v (d_latent) = 2*d_latent
-        - Original stores K (d_kv) + V (d_kv) = 2*d_kv
         - Compression ratio = 2*d_kv / (2*d_latent) = d_kv / d_latent
         - So d_latent = d_kv / compression_ratio
+
+        Joint K/V compression:
+        - Cache stores only c (d_latent), shared for both K and V
+        - Compression ratio = 2*d_kv / d_latent
+        - So d_latent = 2*d_kv / compression_ratio
+
+        Decoupled RoPE compression:
+        - Cache stores [k_rope, v_rope, c_k, c_v] = 2*d_rope + 2*d_latent
+        - Compression ratio = 2*d_kv / (2*d_rope + 2*d_latent)
+        - So d_latent = (2*d_kv / compression_ratio - 2*d_rope) / 2
+                      = d_kv / compression_ratio - d_rope
 
         Note: compression_ratio must be >= 1. A value of 1 means no compression.
         """
         if self.d_latent is not None:
             return self.d_latent
-        # Ensure d_latent doesn't exceed d_kv (would break orthonormal column constraint)
-        return min(self.d_kv, max(1, int(self.d_kv / self.compression_ratio)))
+
+        if self.compression_method == "joint":
+            # Joint needs 2x latent to achieve same compression ratio
+            d_latent = int(2 * self.d_kv / self.compression_ratio)
+        elif self.compression_method == "decoupled_rope":
+            # Account for uncompressed RoPE dimensions
+            d_latent = int(self.d_kv / self.compression_ratio - self.d_rope)
+        else:
+            # Separate compression (default)
+            d_latent = int(self.d_kv / self.compression_ratio)
+
+        # Ensure d_latent is valid (positive and doesn't exceed d_kv)
+        return min(self.d_kv, max(1, d_latent))
 
     @property
     def is_gqa(self) -> bool:

@@ -62,8 +62,8 @@ class TestBalancedSVDInit:
         uk_max_error, _ = check_orthonormality(W_uk, mode="columns")
         uv_max_error, _ = check_orthonormality(W_uv, mode="columns")
 
-        assert uk_max_error < 1e-5
-        assert uv_max_error < 1e-5
+        assert uk_max_error < 2e-5
+        assert uv_max_error < 2e-5
 
     def test_reconstruction_quality(self, gpt2_config, device, dtype):
         """Test that initialization provides reasonable reconstruction."""

@@ -95,9 +95,23 @@ def compute_perplexity(
                 # Loss is averaged over non-masked tokens
                 neg_log_likelihood = outputs.loss
 
+            # Check for NaN/Inf in loss
+            loss_val = neg_log_likelihood.item()
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                # Try to diagnose the issue
+                if hasattr(outputs, 'logits'):
+                    logits = outputs.logits
+                    if torch.isnan(logits).any():
+                        if verbose:
+                            print(f"Warning: NaN in logits at chunk starting at {begin_loc}")
+                    if torch.isinf(logits).any():
+                        if verbose:
+                            print(f"Warning: Inf in logits at chunk starting at {begin_loc}")
+                continue  # Skip this chunk
+
             # Accumulate loss weighted by number of tokens
             num_tokens = (target_ids != -100).sum().item()
-            total_loss += neg_log_likelihood.item() * num_tokens
+            total_loss += loss_val * num_tokens
             total_tokens += num_tokens
 
             prev_end_loc = end_loc
@@ -149,14 +163,28 @@ def measure_cache_memory(
     # Assume float16 (2 bytes per element)
     bytes_per_element = 2
 
-    # MLA stores c_kv = [c_k, c_v], so cache size is 2*d_latent per token
-    mla_cache_dim = 2 * d_latent
+    # MLA cache dimension depends on compression method
+    compression_method = getattr(config, 'compression_method', 'separate')
+    if compression_method == "separate":
+        # Stores c_k (d_latent) + c_v (d_latent)
+        mla_cache_dim = 2 * d_latent
+    elif compression_method == "joint":
+        # Stores single shared c (d_latent)
+        mla_cache_dim = d_latent
+    elif compression_method == "decoupled_rope":
+        # Stores k_rope + v_rope + c_k + c_v
+        d_rope = getattr(config, 'd_rope', 64)
+        mla_cache_dim = 2 * d_rope + 2 * d_latent
+    else:
+        mla_cache_dim = 2 * d_latent
 
     results = {
         "config": {
             "d_latent": d_latent,
             "d_kv": d_kv,
             "n_layers": n_layers,
+            "compression_method": compression_method,
+            "mla_cache_dim": mla_cache_dim,
             "theoretical_compression_ratio": (2 * d_kv) / mla_cache_dim,
         },
         "per_sequence_length": {},

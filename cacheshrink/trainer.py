@@ -136,8 +136,11 @@ class MLATrainer:
     """Trainer for MLA models with Riemannian optimization.
 
     Uses separate optimizers:
-    - AdamW for Euclidean parameters (W_down)
-    - RiemannianAdam for Stiefel manifold parameters (W_uk, W_uv)
+    - AdamW for Euclidean parameters (W_down_k, W_down_v compression matrices)
+    - RiemannianAdam for Stiefel manifold parameters (W_uk, W_uv decompression matrices)
+
+    The decompression matrices are constrained to have orthonormal columns (Stiefel manifold).
+    RiemannianAdam automatically maintains this constraint during optimization.
 
     Supports knowledge distillation training (RECOMMENDED) to match original model outputs.
     """
@@ -246,31 +249,47 @@ class MLATrainer:
 
     def _setup_optimizers(self):
         """Setup separate optimizers for Euclidean and manifold parameters."""
-        euclidean_params = []
-        manifold_params = []
+        self.euclidean_params = []
+        self.manifold_params = []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
 
             if "W_down" in name:
-                euclidean_params.append(param)
+                self.euclidean_params.append(param)
             elif "W_uk" in name or "W_uv" in name:
-                manifold_params.append(param)
+                # Ensure param is a ManifoldParameter on Stiefel manifold
+                # This is needed because loading from disk loses ManifoldParameter type
+                if not isinstance(param, geoopt.ManifoldParameter):
+                    # Convert to ManifoldParameter
+                    stiefel = geoopt.manifolds.Stiefel()
+                    manifold_param = geoopt.ManifoldParameter(param.data, manifold=stiefel)
+                    manifold_param.requires_grad = True
+                    # Replace in model
+                    parts = name.split('.')
+                    obj = self.model
+                    for part in parts[:-1]:
+                        obj = getattr(obj, part)
+                    setattr(obj, parts[-1], manifold_param)
+                    self.manifold_params.append(manifold_param)
+                else:
+                    self.manifold_params.append(param)
 
-        print(f"Euclidean parameters: {len(euclidean_params)}")
-        print(f"Manifold parameters: {len(manifold_params)}")
+        print(f"Euclidean parameters: {len(self.euclidean_params)}")
+        print(f"Manifold parameters: {len(self.manifold_params)}")
 
-        # AdamW for Euclidean parameters
+        # AdamW for Euclidean parameters (W_down compression matrices)
         self.euclidean_optimizer = torch.optim.AdamW(
-            euclidean_params,
+            self.euclidean_params,
             lr=self.config.euclidean_lr,
             weight_decay=self.config.euclidean_weight_decay,
         )
 
-        # RiemannianAdam for manifold parameters
+        # RiemannianAdam for Stiefel manifold parameters (W_uk, W_uv)
+        # This optimizer respects the manifold geometry and maintains orthonormality
         self.riemannian_optimizer = geoopt.optim.RiemannianAdam(
-            manifold_params,
+            self.manifold_params,
             lr=self.config.riemannian_lr,
             weight_decay=self.config.riemannian_weight_decay,
         )
@@ -410,10 +429,11 @@ class MLATrainer:
 
                 # Gradient accumulation
                 if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-                    # Clip gradients
-                    if self.config.max_grad_norm > 0:
+                    # Clip gradients for Euclidean params only
+                    # Don't clip manifold params - let RiemannianAdam handle them properly
+                    if self.config.max_grad_norm > 0 and self.euclidean_params:
                         torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
+                            self.euclidean_params,
                             self.config.max_grad_norm,
                         )
 

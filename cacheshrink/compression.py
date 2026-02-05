@@ -2,13 +2,13 @@
 
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 import geoopt
 from geoopt.manifolds import Stiefel
 
 from .config import MLAConfig
-from .utils import orthonormalize_rows, orthonormalize_columns, check_orthonormality, random_orthonormal_columns
+from .utils import orthonormalize_columns, check_orthonormality, random_orthonormal_columns
 
 
 class MLACompression(nn.Module):
@@ -62,6 +62,7 @@ class MLACompression(nn.Module):
             Latent representation of shape (batch, seq_len, 2*d_latent)
             First d_latent dims are c_k, last d_latent dims are c_v
         """
+        # Always use float32 for numerical stability
         h_f32 = h.float()
         c_k = self.W_down_k(h_f32)
         c_v = self.W_down_v(h_f32)

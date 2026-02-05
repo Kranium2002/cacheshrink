@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cacheshrink"
-version = "0.1.0"
+version = "0.1.1"
 description = "KV Cache Compression via Multi-Head Latent Attention with Riemannian Optimization"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "torch>=2.0.0",
     "transformers>=4.35.0",
+    "accelerate>=0.24.0",
     "geoopt>=0.5.0",
     "datasets>=2.14.0",
     "safetensors>=0.4.0",

@@ -41,7 +41,7 @@ def main():
     # - Qwen/Qwen2.5-0.5B, Qwen/Qwen2.5-1.5B, Qwen/Qwen2.5-3B, Qwen/Qwen2.5-7B
     # - Qwen/Qwen2-0.5B, Qwen/Qwen2-1.5B, Qwen/Qwen2-7B
     MODEL_NAME = "Qwen/Qwen2.5-7B"
-    COMPRESSION_RATIO = 16.0
+    COMPRESSION_RATIO = 4.0
     DEVICE = "cuda"
     DTYPE = torch.float16
 
@@ -225,28 +225,20 @@ def main():
     print(f"  Evaluation time: {ppl_time:.1f}s")
 
     # =========================================================================
-    # Step 5: Fine-tune with Riemannian optimization + KL-guided loss
+    # Step 5: Fine-tune with Riemannian optimization (no distillation to save memory)
     # =========================================================================
     print("\n" + "=" * 70)
-    print("Step 5: Fine-tuning with Riemannian optimization + KL-guided loss")
+    print("Step 5: Fine-tuning with Riemannian optimization (LM loss only)")
     print("=" * 70)
-
-    # Reload original model as teacher
-    print("Loading teacher model for KL-guided training...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=DTYPE,
-        device_map="auto",
-    )
-    teacher_model.eval()
+    print("Note: Skipping distillation to fit in GPU memory")
 
     trainer = MLATrainer(
         model=mla_model,
         tokenizer=tokenizer,
-        teacher_model=teacher_model,
+        teacher_model=None,
         euclidean_lr=1e-5,
         riemannian_lr=1e-4,
-        use_distillation=True,
+        use_distillation=False,
     )
 
     start_time = time.time()
@@ -259,8 +251,6 @@ def main():
     train_time = time.time() - start_time
     print(f"\n  Training time: {train_time:.1f}s")
 
-    # Clean up teacher model
-    del teacher_model
     gc.collect()
     torch.cuda.empty_cache()
 

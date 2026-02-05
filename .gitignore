@@ -42,6 +42,7 @@ htmlcov/
 
 # Model outputs
 llama-7b-mla-*/
+qwen*-mla-*/
 mla_output/
 *.pt
 *.bin
@@ -59,3 +60,9 @@ Thumbs.db
 
 # Logs
 *.log
+*_logs.txt
+*_debug.txt
+*_run.txt
+
+# Temporary files
+1

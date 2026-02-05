@@ -305,6 +305,53 @@ MLAConfig(
 )
 ```
 
+## Compression Methods
+
+cacheshrink supports three compression methods, selectable via the `compression_method` parameter:
+
+```python
+model, tokenizer = convert_to_mla(
+    "meta-llama/Llama-2-7b-hf",
+    compression_ratio=4.0,
+    compression_method="separate",  # "separate", "joint", or "decoupled_rope"
+)
+```
+
+### Separate K/V Compression (Default, Recommended)
+
+The default method compresses K and V independently:
+- Cache stores `[c_k, c_v]` where each has dimension `d_latent`
+- Best reconstruction quality for post-hoc conversion
+- Recommended for all use cases
+
+### Joint K/V Compression (Experimental)
+
+> **Warning:** Joint compression does not work well for post-hoc conversion of pre-trained models. It achieves 85-300% reconstruction error compared to 10-75% for separate compression. Only use this if you plan to train a model from scratch with this architecture.
+
+DeepSeek-style compression with a single shared latent:
+- Cache stores only `c` (single latent for both K and V)
+- 2x more memory efficient than separate at same `d_latent`
+- Works well when models are trained from scratch with joint compression
+- Does NOT work well for converting existing pre-trained models because K and V have different statistical structures
+
+### Decoupled RoPE Compression (Experimental)
+
+> **Warning:** This method is experimental. It preserves a portion of the keys/values uncompressed for positional information, which limits the maximum achievable compression ratio.
+
+Separates positional encoding from compressed content:
+- Keeps `d_rope` dimensions uncompressed for RoPE
+- Compresses remaining dimensions
+- Effective compression is limited by `d_rope` (e.g., with `d_rope=64`, max compression at 8x is only achievable if `d_kv > 128`)
+
+```python
+model, tokenizer = convert_to_mla(
+    "meta-llama/Llama-2-7b-hf",
+    compression_ratio=4.0,
+    compression_method="decoupled_rope",
+    d_rope=64,  # Uncompressed dimensions for positional info
+)
+```
+
 ## Advanced Usage
 
 ### Custom Initialization

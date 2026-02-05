@@ -8,10 +8,13 @@ Key improvements over basic SVD:
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, TYPE_CHECKING
 from tqdm import tqdm
 
 from .utils import orthonormalize_columns
+
+if TYPE_CHECKING:
+    from .config import MLAConfig
 
 
 def calibration_aware_svd(
@@ -174,12 +177,12 @@ def joint_kv_svd(
     W_uk = orthonormalize_columns(W_uk)
     W_uv = orthonormalize_columns(W_uv)
 
-    # Recompute W_down to be optimal for orthonormalized W_u
-    # W_down = W_u.T @ W (for each)
-    # But we have shared W_down, so we minimize joint error
-    # This is approximate - could iterate to refine
+    # Keep the original W_down from SVD - it was optimized for joint K/V reconstruction
+    # and changing it after orthonormalization often makes things worse.
+    # The orthonormalization of W_uk/W_uv will cause some reconstruction loss,
+    # but that's the price we pay for Stiefel manifold constraint.
 
-    # Reconstruction
+    # Reconstruction (using original C from before orthonormalization - just for stats)
     K_recon = C @ W_uk.T
     V_recon = C @ W_uv.T
 
@@ -194,6 +197,141 @@ def joint_kv_svd(
     }
 
     return W_down.to(dtype), W_uk.to(dtype), W_uv.to(dtype), stats
+
+
+class JointKVCompression(nn.Module):
+    """Joint K-V compression with shared latent (DeepSeek MLA style).
+
+    Uses a SINGLE shared latent c that reconstructs both K and V:
+    - c = H @ W_down.T
+    - K = c @ W_uk.T
+    - V = c @ W_uv.T
+
+    This is more efficient than separate compression:
+    - Cache stores only c (d_latent) instead of [c_k, c_v] (2*d_latent)
+    - For the same cache size, can use 2x larger d_latent
+
+    Trade-off: K and V must share the same compressed representation,
+    which may slightly reduce reconstruction quality.
+    """
+
+    def __init__(self, config: "MLAConfig"):
+        """Initialize joint K-V compression.
+
+        Args:
+            config: MLA configuration
+        """
+        super().__init__()
+        self.config = config
+        self.d_model = config.d_model
+        self.d_latent = config.computed_d_latent
+        self.d_kv = config.d_kv
+
+        # Shared compression (single projection for both K and V)
+        self.W_down = nn.Linear(self.d_model, self.d_latent, bias=False)
+
+        # Separate decompression on Stiefel manifold
+        import geoopt
+        from geoopt.manifolds import Stiefel
+
+        self.stiefel = Stiefel(canonical=False)
+
+        W_uk_init = orthonormalize_columns(torch.randn(self.d_kv, self.d_latent))
+        W_uv_init = orthonormalize_columns(torch.randn(self.d_kv, self.d_latent))
+
+        self.W_uk = geoopt.ManifoldParameter(W_uk_init.float(), manifold=self.stiefel)
+        self.W_uv = geoopt.ManifoldParameter(W_uv_init.float(), manifold=self.stiefel)
+
+    def compress(self, h: torch.Tensor) -> torch.Tensor:
+        """Compress hidden states to shared latent.
+
+        Args:
+            h: Hidden states of shape (batch, seq_len, d_model)
+
+        Returns:
+            Latent representation of shape (batch, seq_len, d_latent)
+        """
+        # Cast input to match weight dtype (weights kept float32 for Riemannian optimization)
+        original_dtype = h.dtype
+        h_float = h.to(self.W_down.weight.dtype)
+        return self.W_down(h_float).to(original_dtype)
+
+    def decompress_k(self, c: torch.Tensor) -> torch.Tensor:
+        """Decompress latent to keys."""
+        # W_uk is kept float32 for Riemannian optimization
+        return torch.matmul(c.float(), self.W_uk.float().T).to(c.dtype)
+
+    def decompress_v(self, c: torch.Tensor) -> torch.Tensor:
+        """Decompress latent to values."""
+        # W_uv is kept float32 for Riemannian optimization
+        return torch.matmul(c.float(), self.W_uv.float().T).to(c.dtype)
+
+    def decompress(self, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decompress latent to keys and values."""
+        return self.decompress_k(c), self.decompress_v(c)
+
+    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compress and decompress.
+
+        Returns:
+            Tuple of (c, K, V)
+        """
+        c = self.compress(h)
+        K = self.decompress_k(c)
+        V = self.decompress_v(c)
+        return c, K, V
+
+    def check_orthonormality(self) -> Dict[str, Tuple[float, float]]:
+        """Check orthonormality of decompression matrices."""
+        from .utils import check_orthonormality
+        return {
+            "W_uk": check_orthonormality(self.W_uk, mode="columns"),
+            "W_uv": check_orthonormality(self.W_uv, mode="columns"),
+        }
+
+    def init_from_weights(
+        self,
+        W_down: torch.Tensor,
+        W_uk: torch.Tensor,
+        W_uv: torch.Tensor,
+    ) -> None:
+        """Initialize from pre-computed weights."""
+        self.W_down.weight.data = W_down.to(self.W_down.weight.device).float()
+        self.W_uk.data = W_uk.to(self.W_uk.device).float()
+        self.W_uv.data = W_uv.to(self.W_uv.device).float()
+
+    @property
+    def cache_dim(self) -> int:
+        """Dimension of compressed cache per token."""
+        return self.d_latent  # Just c, not [c_k, c_v]
+
+    @property
+    def compression_ratio(self) -> float:
+        """Effective compression ratio."""
+        return (2 * self.d_kv) / self.d_latent
+
+    def _apply(self, fn):
+        """Override _apply to keep trainable parameters in float32.
+
+        This prevents manifold parameters from being converted to float16
+        when model.to(dtype) is called, which would break Riemannian optimization
+        since geoopt's QR decomposition doesn't support half precision.
+        """
+        super()._apply(fn)
+        if self.W_down.weight.dtype != torch.float32:
+            self.W_down.weight.data = self.W_down.weight.data.float()
+        if self.W_uk.dtype != torch.float32:
+            self.W_uk.data = self.W_uk.data.float()
+        if self.W_uv.dtype != torch.float32:
+            self.W_uv.data = self.W_uv.data.float()
+        return self
+
+    def extra_repr(self) -> str:
+        return (
+            f"d_model={self.d_model}, d_latent={self.d_latent}, d_kv={self.d_kv}, "
+            f"compression_ratio={self.compression_ratio:.1f}x (joint), "
+            f"cache_size=d_latent={self.d_latent}"
+        )
 
 
 class DecoupledRoPECompression(nn.Module):
@@ -238,8 +376,8 @@ class DecoupledRoPECompression(nn.Module):
         self.stiefel = Stiefel(canonical=False)
         W_uk_init = torch.randn(self.d_content, d_latent)
         W_uv_init = torch.randn(self.d_content, d_latent)
-        W_uk_init = orthonormalize_columns(W_uk_init)
-        W_uv_init = orthonormalize_columns(W_uv_init)
+        W_uk_init = orthonormalize_columns(W_uk_init).float()
+        W_uv_init = orthonormalize_columns(W_uv_init).float()
 
         self.W_uk = geoopt.ManifoldParameter(W_uk_init, manifold=self.stiefel)
         self.W_uv = geoopt.ManifoldParameter(W_uv_init, manifold=self.stiefel)
@@ -253,30 +391,33 @@ class DecoupledRoPECompression(nn.Module):
         - Next d_latent: c_k (compressed K content)
         - Last d_latent: c_v (compressed V content)
         """
-        h_f32 = h.float()
+        # Cast input to match weight dtype (weights kept float32 for Riemannian optimization)
+        original_dtype = h.dtype
+        h_float = h.to(self.W_rope_k.weight.dtype)
+        k_rope = self.W_rope_k(h_float)
+        v_rope = self.W_rope_v(h_float)
+        c_k = self.W_down_k(h_float)
+        c_v = self.W_down_v(h_float)
 
-        k_rope = self.W_rope_k(h_f32)
-        v_rope = self.W_rope_v(h_f32)
-        c_k = self.W_down_k(h_f32)
-        c_v = self.W_down_v(h_f32)
-
-        return torch.cat([k_rope, v_rope, c_k, c_v], dim=-1).to(h.dtype)
+        return torch.cat([k_rope, v_rope, c_k, c_v], dim=-1).to(original_dtype)
 
     def decompress_k(self, compressed: torch.Tensor) -> torch.Tensor:
         """Decompress to full K."""
-        k_rope = compressed[..., :self.d_rope].float()
-        c_k = compressed[..., 2*self.d_rope:2*self.d_rope+self.d_latent].float()
+        k_rope = compressed[..., :self.d_rope]
+        c_k = compressed[..., 2*self.d_rope:2*self.d_rope+self.d_latent]
 
-        k_content = c_k @ self.W_uk.T
-        return torch.cat([k_rope, k_content], dim=-1).to(compressed.dtype)
+        # W_uk is kept float32 for Riemannian optimization
+        k_content = torch.matmul(c_k.float(), self.W_uk.float().T).to(compressed.dtype)
+        return torch.cat([k_rope, k_content], dim=-1)
 
     def decompress_v(self, compressed: torch.Tensor) -> torch.Tensor:
         """Decompress to full V."""
-        v_rope = compressed[..., self.d_rope:2*self.d_rope].float()
-        c_v = compressed[..., 2*self.d_rope+self.d_latent:].float()
+        v_rope = compressed[..., self.d_rope:2*self.d_rope]
+        c_v = compressed[..., 2*self.d_rope+self.d_latent:]
 
-        v_content = c_v @ self.W_uv.T
-        return torch.cat([v_rope, v_content], dim=-1).to(compressed.dtype)
+        # W_uv is kept float32 for Riemannian optimization
+        v_content = torch.matmul(c_v.float(), self.W_uv.float().T).to(compressed.dtype)
+        return torch.cat([v_rope, v_content], dim=-1)
 
     @property
     def cache_dim(self) -> int:
@@ -289,6 +430,53 @@ class DecoupledRoPECompression(nn.Module):
         original = 2 * self.d_kv
         compressed = self.cache_dim
         return original / compressed
+
+    def check_orthonormality(self) -> Dict[str, Tuple[float, float]]:
+        """Check orthonormality of decompression matrices."""
+        from .utils import check_orthonormality
+        return {
+            "W_uk": check_orthonormality(self.W_uk, mode="columns"),
+            "W_uv": check_orthonormality(self.W_uv, mode="columns"),
+        }
+
+    def decompress(self, compressed: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decompress to keys and values."""
+        return self.decompress_k(compressed), self.decompress_v(compressed)
+
+    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compress and decompress."""
+        c = self.compress(h)
+        K = self.decompress_k(c)
+        V = self.decompress_v(c)
+        return c, K, V
+
+    def _apply(self, fn):
+        """Override _apply to keep trainable parameters in float32.
+
+        This prevents manifold parameters from being converted to float16
+        when model.to(dtype) is called, which would break Riemannian optimization
+        since geoopt's QR decomposition doesn't support half precision.
+        """
+        super()._apply(fn)
+        if self.W_rope_k.weight.dtype != torch.float32:
+            self.W_rope_k.weight.data = self.W_rope_k.weight.data.float()
+        if self.W_rope_v.weight.dtype != torch.float32:
+            self.W_rope_v.weight.data = self.W_rope_v.weight.data.float()
+        if self.W_down_k.weight.dtype != torch.float32:
+            self.W_down_k.weight.data = self.W_down_k.weight.data.float()
+        if self.W_down_v.weight.dtype != torch.float32:
+            self.W_down_v.weight.data = self.W_down_v.weight.data.float()
+        if self.W_uk.dtype != torch.float32:
+            self.W_uk.data = self.W_uk.data.float()
+        if self.W_uv.dtype != torch.float32:
+            self.W_uv.data = self.W_uv.data.float()
+        return self
+
+    def extra_repr(self) -> str:
+        return (
+            f"d_model={self.d_model}, d_kv={self.d_kv}, d_rope={self.d_rope}, "
+            f"d_latent={self.d_latent}, compression_ratio={self.compression_ratio:.1f}x"
+        )
 
 
 def init_decoupled_rope_from_weights(
@@ -315,9 +503,9 @@ def init_decoupled_rope_from_weights(
     W_k_content = W_k[d_rope:, :]  # (d_content, d_model)
     W_v_content = W_v[d_rope:, :]
 
-    # Set RoPE projections directly
-    compression.W_rope_k.weight.data = W_k_rope.clone()
-    compression.W_rope_v.weight.data = W_v_rope.clone()
+    # Set RoPE projections directly (keep float32 for training stability)
+    compression.W_rope_k.weight.data = W_k_rope.clone().float()
+    compression.W_rope_v.weight.data = W_v_rope.clone().float()
 
     # Initialize content compression
     if hidden_states is not None:
@@ -350,10 +538,11 @@ def init_decoupled_rope_from_weights(
     W_down_k = W_uk.T @ W_k_content.float()
     W_down_v = W_uv.T @ W_v_content.float()
 
-    compression.W_down_k.weight.data = W_down_k.to(dtype)
-    compression.W_down_v.weight.data = W_down_v.to(dtype)
-    compression.W_uk.data = W_uk.to(dtype)
-    compression.W_uv.data = W_uv.to(dtype)
+    # Keep trainable parameters in float32 for Riemannian optimization stability
+    compression.W_down_k.weight.data = W_down_k.float()
+    compression.W_down_v.weight.data = W_down_v.float()
+    compression.W_uk.data = W_uk.float()
+    compression.W_uv.data = W_uv.float()
 
     return {
         "k_content_energy": energy_k.item(),

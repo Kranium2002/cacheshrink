@@ -22,7 +22,7 @@ Example usage:
     model, tokenizer = load_mla_model("my-mla-model")
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Core conversion function
 from .converter import convert_to_mla
@@ -47,6 +47,15 @@ from .evaluation import (
 # Core modules (for advanced usage)
 from .compression import MLACompression
 from .attention import MLAAttention, RotaryEmbedding, MLACache
+
+# Improved compression methods
+from .improved_compression import (
+    JointKVCompression,
+    DecoupledRoPECompression,
+    calibration_aware_svd,
+    joint_kv_svd,
+    init_decoupled_rope_from_weights,
+)
 
 # Initialization
 from .initialization import (
@@ -93,6 +102,12 @@ __all__ = [
     "MLAAttention",
     "RotaryEmbedding",
     "MLACache",
+    # Improved compression methods
+    "JointKVCompression",
+    "DecoupledRoPECompression",
+    "calibration_aware_svd",
+    "joint_kv_svd",
+    "init_decoupled_rope_from_weights",
     # Initialization
     "balanced_svd_init",
     "collect_calibration_data",
