@@ -48,6 +48,10 @@ class TrainingConfig:
     distillation_temperature: float = 2.0  # Temperature for softmax in distillation
     distillation_alpha: float = 0.9  # Weight of distillation loss (1-alpha for LM loss)
 
+    # Reconstruction loss settings (alternative to distillation, no teacher needed)
+    use_reconstruction_loss: bool = False  # Use direct K/V reconstruction loss
+    reconstruction_alpha: float = 0.1  # Weight of reconstruction loss (added to existing loss)
+
     # Logging and saving
     logging_steps: int = 10
     save_steps: int = 0  # 0 = disabled, set to e.g. 1000 to save every 1000 steps
@@ -154,6 +158,8 @@ class MLATrainer:
         riemannian_lr: float = 1e-4,
         teacher_model: Optional[nn.Module] = None,
         use_distillation: bool = True,
+        use_reconstruction_loss: bool = False,
+        reconstruction_alpha: float = 0.1,
         save_steps: int = 0,
     ):
         """Initialize trainer.
@@ -167,6 +173,10 @@ class MLATrainer:
             teacher_model: Original (non-MLA) model for distillation. If None and
                 use_distillation=True, will load from mla_config.model_name
             use_distillation: Whether to use knowledge distillation (RECOMMENDED)
+            use_reconstruction_loss: Whether to use direct K/V reconstruction loss.
+                Requires model to have original weights stored (store_original_weights=True
+                during conversion).
+            reconstruction_alpha: Weight of reconstruction loss (0.0-1.0)
             save_steps: Save checkpoint every N steps (0 = disabled)
         """
         self.model = model
@@ -177,6 +187,8 @@ class MLATrainer:
                 euclidean_lr=euclidean_lr,
                 riemannian_lr=riemannian_lr,
                 use_distillation=use_distillation,
+                use_reconstruction_loss=use_reconstruction_loss,
+                reconstruction_alpha=reconstruction_alpha,
                 save_steps=save_steps,
             )
         self.config = config
@@ -203,12 +215,17 @@ class MLATrainer:
         # Setup optimizers
         self._setup_optimizers()
 
+        # Validate reconstruction loss setup
+        if self.config.use_reconstruction_loss:
+            self._validate_reconstruction_loss_setup()
+
         # Training state
         self.global_step = 0
         self.training_stats = {
             "train_loss": [],
             "distillation_loss": [],
             "lm_loss": [],
+            "reconstruction_loss": [],
             "orthonormality_errors": [],
             "learning_rates": [],
         }
@@ -328,6 +345,112 @@ class MLATrainer:
 
         return errors
 
+    def _validate_reconstruction_loss_setup(self) -> None:
+        """Validate that model has original weights stored for reconstruction loss."""
+        # Check first layer to see if original weights are available
+        compression = self._get_compression_module(0)
+        if compression is None:
+            raise ValueError("Could not find compression module in model")
+
+        if not compression.has_original_weights():
+            raise ValueError(
+                "Reconstruction loss requires original weights to be stored. "
+                "Convert model with store_original_weights=True."
+            )
+
+    def _get_compression_module(self, layer_idx: int):
+        """Get the compression module for a specific layer.
+
+        Args:
+            layer_idx: Index of the layer
+
+        Returns:
+            The compression module, or None if not found
+        """
+        if self.mla_config.model_type == "gpt2":
+            attn = self.model.transformer.h[layer_idx].attn
+        else:
+            attn = self.model.model.layers[layer_idx].self_attn
+
+        if hasattr(attn, "mla"):
+            return attn.mla.mla_compression
+        elif hasattr(attn, "mla_compression"):
+            return attn.mla_compression
+        return None
+
+    def _capture_layer_inputs(self, batch: Dict[str, torch.Tensor]) -> Dict[int, torch.Tensor]:
+        """Capture hidden states at the input of each attention layer.
+
+        Uses forward hooks to capture the hidden states fed into each attention layer.
+
+        Args:
+            batch: Input batch with input_ids and attention_mask
+
+        Returns:
+            Dictionary mapping layer_idx to hidden states tensor
+        """
+        hidden_states_dict = {}
+        hooks = []
+
+        def make_hook(layer_idx):
+            def hook(module, args, kwargs=None):
+                # The first argument to attention is hidden_states
+                if len(args) > 0:
+                    h = args[0]
+                else:
+                    h = kwargs.get('hidden_states', None) if kwargs else None
+                if h is not None:
+                    hidden_states_dict[layer_idx] = h.detach()
+            return hook
+
+        # Register hooks on each attention module
+        for layer_idx in range(self.mla_config.n_layers):
+            if self.mla_config.model_type == "gpt2":
+                attn = self.model.transformer.h[layer_idx].attn
+            else:
+                attn = self.model.model.layers[layer_idx].self_attn
+
+            hook = attn.register_forward_pre_hook(make_hook(layer_idx), with_kwargs=True)
+            hooks.append(hook)
+
+        # Run forward pass to capture hidden states
+        with torch.no_grad():
+            _ = self.model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+            )
+
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+
+        return hidden_states_dict
+
+    def _compute_reconstruction_loss(self, hidden_states_dict: Dict[int, torch.Tensor]) -> torch.Tensor:
+        """Compute average reconstruction loss across all layers.
+
+        Args:
+            hidden_states_dict: Dictionary mapping layer_idx to hidden states
+
+        Returns:
+            Average reconstruction loss (scalar tensor)
+        """
+        total_loss = 0.0
+        n_layers = 0
+
+        for layer_idx, h in hidden_states_dict.items():
+            compression = self._get_compression_module(layer_idx)
+            if compression is not None and compression.has_original_weights():
+                # Need gradients for this computation
+                h_with_grad = h.clone().requires_grad_(True)
+                k_loss, v_loss = compression.compute_reconstruction_loss(h_with_grad)
+                total_loss = total_loss + k_loss + v_loss
+                n_layers += 1
+
+        if n_layers > 0:
+            return total_loss / (2 * n_layers)
+        return torch.tensor(0.0, device=self.device)
+
     def train(
         self,
         dataset,
@@ -381,6 +504,7 @@ class MLATrainer:
             epoch_loss = 0.0
             epoch_distill_loss = 0.0
             epoch_lm_loss = 0.0
+            epoch_recon_loss = 0.0
             num_batches = 0
 
             progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
@@ -424,6 +548,17 @@ class MLATrainer:
                     loss = outputs.loss
                     epoch_lm_loss += loss.item()
 
+                # Add reconstruction loss if enabled
+                if self.config.use_reconstruction_loss:
+                    # Capture hidden states for reconstruction loss
+                    hidden_states = self._capture_layer_inputs(batch)
+                    recon_loss = self._compute_reconstruction_loss(hidden_states)
+                    epoch_recon_loss += recon_loss.item()
+
+                    # Blend reconstruction loss with existing loss
+                    alpha = self.config.reconstruction_alpha
+                    loss = (1 - alpha) * loss + alpha * recon_loss
+
                 # Backward pass
                 loss.backward()
 
@@ -454,17 +589,22 @@ class MLATrainer:
                 if self.global_step % self.config.logging_steps == 0:
                     avg_loss = epoch_loss / num_batches
                     self.training_stats["train_loss"].append(avg_loss)
+
+                    postfix = {"loss": f"{avg_loss:.4f}"}
+
                     if self.config.use_distillation:
                         avg_distill = epoch_distill_loss / num_batches
                         avg_lm = epoch_lm_loss / num_batches
                         self.training_stats["distillation_loss"].append(avg_distill)
                         self.training_stats["lm_loss"].append(avg_lm)
-                        progress_bar.set_postfix({
-                            "loss": f"{avg_loss:.4f}",
-                            "distill": f"{avg_distill:.4f}"
-                        })
-                    else:
-                        progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
+                        postfix["distill"] = f"{avg_distill:.4f}"
+
+                    if self.config.use_reconstruction_loss:
+                        avg_recon = epoch_recon_loss / num_batches
+                        self.training_stats["reconstruction_loss"].append(avg_recon)
+                        postfix["recon"] = f"{avg_recon:.4f}"
+
+                    progress_bar.set_postfix(postfix)
 
                 # Check orthonormality
                 if self.global_step % self.config.check_orthonormality_steps == 0:

@@ -14,7 +14,7 @@ Achieve **4-16x KV cache compression** on LLaMA, Mistral, GPT-2, and other trans
 - **Drop-in replacement** - Works with existing HuggingFace models and generation pipelines
 - **Mathematically principled** - Stiefel manifold constraints ensure stable compression/decompression
 - **Calibration-aware initialization** - SVD-based initialization using real activation statistics
-- **Knowledge distillation** - Fine-tune compressed models to match original model outputs
+- **Flexible training options** - Knowledge distillation or reconstruction loss (no teacher model needed)
 - **Multiple model support** - LLaMA 2/3, Mistral, Qwen, GPT-2, and extensible to others
 
 ## How It Works
@@ -146,9 +146,44 @@ model, tokenizer = convert_to_mla(
 )
 ```
 
+### Fine-tuning with Reconstruction Loss (Recommended)
+
+The simplest approach is to use reconstruction loss, which directly optimizes the compression matrices to reconstruct the original K/V outputs. This doesn't require a teacher model:
+
+```python
+from cacheshrink import MLATrainer
+
+# Convert with original weights stored for reconstruction loss
+model, tokenizer = convert_to_mla(
+    "meta-llama/Llama-2-7b-hf",
+    compression_ratio=4.0,
+    device="cuda",
+    store_original_weights=True,  # Required for reconstruction loss
+)
+
+# Create trainer with reconstruction loss
+trainer = MLATrainer(
+    model=model,
+    tokenizer=tokenizer,
+    euclidean_lr=1e-5,              # Learning rate for W_down (compression)
+    riemannian_lr=1e-4,             # Learning rate for W_uk, W_uv (decompression)
+    use_distillation=False,
+    use_reconstruction_loss=True,   # Optimize K/V reconstruction directly
+    reconstruction_alpha=0.1,       # Weight of reconstruction loss
+)
+
+# Train on your data
+trainer.train(
+    train_texts,           # List of strings or HuggingFace dataset
+    num_epochs=10,
+    batch_size=4,
+    max_length=512,
+)
+```
+
 ### Fine-tuning with Knowledge Distillation
 
-For best results, fine-tune the compressed model using knowledge distillation:
+Alternatively, fine-tune the compressed model using knowledge distillation from the original model:
 
 ```python
 from cacheshrink import MLATrainer
@@ -260,6 +295,7 @@ convert_to_mla(
     dtype: torch.dtype = torch.float16,
     use_calibration: bool = True,        # Use activation statistics
     num_calibration_samples: int = 128,
+    store_original_weights: bool = False, # Store W_k/W_v for reconstruction loss
     verbose: bool = True,
 ) -> Tuple[nn.Module, Tokenizer]
 
@@ -274,10 +310,12 @@ load_mla_model(path: str, device: str = "cuda") -> Tuple[nn.Module, Tokenizer]
 MLATrainer(
     model: nn.Module,
     tokenizer: Tokenizer,
-    teacher_model: nn.Module = None,     # For distillation
+    teacher_model: nn.Module = None,     # For distillation (optional)
     euclidean_lr: float = 1e-5,          # W_down learning rate
     riemannian_lr: float = 1e-4,         # W_uk, W_uv learning rate
-    use_distillation: bool = True,       # Recommended
+    use_distillation: bool = True,       # Use knowledge distillation
+    use_reconstruction_loss: bool = False, # Use K/V reconstruction loss
+    reconstruction_alpha: float = 0.1,   # Weight of reconstruction loss
 )
 ```
 
@@ -392,9 +430,14 @@ config = TrainingConfig(
     num_epochs=10,
     batch_size=4,
     max_length=512,
+    # Distillation settings (requires teacher model)
     use_distillation=True,
     distillation_temperature=2.0,
     distillation_alpha=0.9,           # 90% distillation, 10% LM loss
+    # Reconstruction loss settings (no teacher needed)
+    use_reconstruction_loss=False,
+    reconstruction_alpha=0.1,         # Weight of reconstruction loss
+    # Monitoring
     check_orthonormality_steps=100,   # Monitor constraint satisfaction
 )
 ```
@@ -414,9 +457,35 @@ cacheshrink uses separate optimizers for different parameter types:
    - Updates follow geodesics to maintain orthonormality
    - No explicit re-orthonormalization needed
 
-### Knowledge Distillation
+### Training Loss Options
 
-Instead of training on language modeling loss alone (which can cause the compressed model to drift), we use knowledge distillation:
+cacheshrink supports two training approaches:
+
+#### Reconstruction Loss (Recommended)
+
+Reconstruction loss directly optimizes the compression matrices to minimize the error between original and reconstructed K/V projections:
+
+```
+Loss = (1-α) × LM_loss + α × Reconstruction_loss
+
+where:
+  Reconstruction_loss = MSE(K_reconstructed, K_original) + MSE(V_reconstructed, V_original)
+  K_original = hidden_states @ W_k_original.T  (stored during conversion)
+  K_reconstructed = decompress_k(compress(hidden_states))
+  α = reconstruction weight (default 0.1)
+```
+
+**Advantages:**
+- No teacher model needed (saves GPU memory)
+- Direct gradient signal to compression matrices
+- Simpler setup
+
+**Requirements:**
+- Must convert with `store_original_weights=True`
+
+#### Knowledge Distillation
+
+Knowledge distillation trains the compressed model to match the original model's output distribution:
 
 ```
 Loss = α × KL(student || teacher) + (1-α) × LM_loss
@@ -428,7 +497,12 @@ where:
   - α = distillation weight (default 0.9)
 ```
 
-This keeps the compressed model's behavior close to the original.
+**Advantages:**
+- Keeps behavior close to original model
+- Well-established technique
+
+**Requirements:**
+- Requires loading teacher model (2x GPU memory)
 
 ## Citation
 

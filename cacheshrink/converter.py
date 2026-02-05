@@ -38,6 +38,7 @@ def convert_to_mla(
     max_calibration_length: int = 512,
     trust_remote_code: bool = True,
     use_randomized_svd: bool = False,
+    store_original_weights: bool = False,
     verbose: bool = True,
 ) -> Tuple[nn.Module, "AutoTokenizer"]:
     """Convert a HuggingFace model to use Multi-Head Latent Attention.
@@ -68,6 +69,8 @@ def convert_to_mla(
         max_calibration_length: Maximum sequence length for calibration
         trust_remote_code: Whether to trust remote code (needed for some models)
         use_randomized_svd: Use fast randomized SVD (50x faster, <1% accuracy loss)
+        store_original_weights: Store original W_k/W_v as frozen buffers for reconstruction
+            loss during training. Required for training with use_reconstruction_loss=True.
         verbose: Whether to print progress
 
     Returns:
@@ -179,6 +182,10 @@ def convert_to_mla(
                 mla_attn, W_k, W_v, mla_config.computed_d_latent,
                 d_rope, layer_calibration
             )
+
+        # Store original weights for reconstruction loss if requested
+        if store_original_weights:
+            mla_attn.mla_compression.store_original_weights(W_k, W_v)
 
         # Copy Q projection weights
         mla_attn.q_proj.weight.data = W_q.clone()

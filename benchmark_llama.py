@@ -162,6 +162,7 @@ def main():
             num_calibration_samples=256,  # More calibration samples
             max_calibration_length=1024,  # Longer sequences for better SVD
             use_randomized_svd=False,  # Full SVD is more stable
+            store_original_weights=True,  # Store for reconstruction loss
             verbose=True,
         )
         conversion_time = time.time() - start_time
@@ -213,42 +214,33 @@ def main():
     print(f"  Evaluation time: {ppl_time:.1f}s")
 
     # =========================================================================
-    # Step 5: Fine-tune with Riemannian optimization + DISTILLATION
+    # Step 5: Fine-tune with Riemannian optimization + Reconstruction Loss
     # =========================================================================
     print("\n" + "=" * 70)
-    print("Step 5: Fine-tuning with Riemannian optimization + Knowledge Distillation")
+    print("Step 5: Fine-tuning with Riemannian optimization + Reconstruction Loss")
     print("=" * 70)
-
-    # Reload original model as teacher for distillation
-    print("Loading teacher model for distillation...")
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=DTYPE,
-        device_map="auto",
-    )
-    teacher_model.eval()
+    print("Note: Using reconstruction loss (no teacher model needed, saves memory)")
 
     trainer = MLATrainer(
         model=mla_model,
         tokenizer=tokenizer,
-        teacher_model=teacher_model,  # Use original model as teacher
         euclidean_lr=1e-5,  # Lower LR for stability
         riemannian_lr=1e-4,  # Lower LR for Riemannian params
-        use_distillation=True,  # Enable distillation
+        use_distillation=False,
+        use_reconstruction_loss=True,  # Use K/V reconstruction loss
+        reconstruction_alpha=0.1,  # Weight of reconstruction loss
     )
 
     start_time = time.time()
     training_stats = trainer.train(
         train_texts,
-        num_epochs=40,
+        num_epochs=3,
         batch_size=2,  # Reduced for longer sequences
         max_length=MAX_LENGTH,
     )
     train_time = time.time() - start_time
     print(f"\n  Training time: {train_time:.1f}s")
 
-    # Clean up teacher model
-    del teacher_model
     gc.collect()
     torch.cuda.empty_cache()
 

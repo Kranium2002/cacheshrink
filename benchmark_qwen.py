@@ -175,6 +175,7 @@ def main():
             num_calibration_samples=256,
             max_calibration_length=1024,
             use_randomized_svd=False,
+            store_original_weights=True,  # Store for reconstruction loss
             verbose=True,
         )
         conversion_time = time.time() - start_time
@@ -225,20 +226,21 @@ def main():
     print(f"  Evaluation time: {ppl_time:.1f}s")
 
     # =========================================================================
-    # Step 5: Fine-tune with Riemannian optimization (no distillation to save memory)
+    # Step 5: Fine-tune with Riemannian optimization + Reconstruction Loss
     # =========================================================================
     print("\n" + "=" * 70)
-    print("Step 5: Fine-tuning with Riemannian optimization (LM loss only)")
+    print("Step 5: Fine-tuning with Riemannian optimization + Reconstruction Loss")
     print("=" * 70)
-    print("Note: Skipping distillation to fit in GPU memory")
+    print("Note: Using reconstruction loss (no teacher model needed, saves memory)")
 
     trainer = MLATrainer(
         model=mla_model,
         tokenizer=tokenizer,
-        teacher_model=None,
         euclidean_lr=1e-5,
         riemannian_lr=1e-4,
         use_distillation=False,
+        use_reconstruction_loss=True,  # Use K/V reconstruction loss
+        reconstruction_alpha=0.1,  # Weight of reconstruction loss
     )
 
     start_time = time.time()
