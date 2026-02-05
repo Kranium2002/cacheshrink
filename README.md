@@ -169,7 +169,7 @@ trainer = MLATrainer(
     riemannian_lr=1e-4,             # Learning rate for W_uk, W_uv (decompression)
     use_distillation=False,
     use_reconstruction_loss=True,   # Optimize K/V reconstruction directly
-    reconstruction_alpha=0.1,       # Weight of reconstruction loss
+    reconstruction_alpha=0.3,       # Weight of reconstruction loss
 )
 
 # Train on your data
@@ -315,7 +315,7 @@ MLATrainer(
     riemannian_lr: float = 1e-4,         # W_uk, W_uv learning rate
     use_distillation: bool = True,       # Use knowledge distillation
     use_reconstruction_loss: bool = False, # Use K/V reconstruction loss
-    reconstruction_alpha: float = 0.1,   # Weight of reconstruction loss
+    reconstruction_alpha: float = 0.3,   # Weight of reconstruction loss
 )
 ```
 
@@ -436,7 +436,7 @@ config = TrainingConfig(
     distillation_alpha=0.9,           # 90% distillation, 10% LM loss
     # Reconstruction loss settings (no teacher needed)
     use_reconstruction_loss=False,
-    reconstruction_alpha=0.1,         # Weight of reconstruction loss
+    reconstruction_alpha=0.3,         # Weight of reconstruction loss
     # Monitoring
     check_orthonormality_steps=100,   # Monitor constraint satisfaction
 )

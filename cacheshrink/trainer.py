@@ -50,7 +50,7 @@ class TrainingConfig:
 
     # Reconstruction loss settings (alternative to distillation, no teacher needed)
     use_reconstruction_loss: bool = False  # Use direct K/V reconstruction loss
-    reconstruction_alpha: float = 0.1  # Weight of reconstruction loss (added to existing loss)
+    reconstruction_alpha: float = 0.3  # Weight of reconstruction loss (added to existing loss)
 
     # Logging and saving
     logging_steps: int = 10
@@ -159,7 +159,7 @@ class MLATrainer:
         teacher_model: Optional[nn.Module] = None,
         use_distillation: bool = True,
         use_reconstruction_loss: bool = False,
-        reconstruction_alpha: float = 0.1,
+        reconstruction_alpha: float = 0.3,
         save_steps: int = 0,
     ):
         """Initialize trainer.

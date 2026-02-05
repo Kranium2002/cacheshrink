@@ -228,7 +228,7 @@ def main():
         riemannian_lr=1e-4,  # Lower LR for Riemannian params
         use_distillation=False,
         use_reconstruction_loss=True,  # Use K/V reconstruction loss
-        reconstruction_alpha=0.1,  # Weight of reconstruction loss
+        reconstruction_alpha=0.3,  # Weight of reconstruction loss
     )
 
     start_time = time.time()
