@@ -274,12 +274,8 @@ class MLATrainer:
                 for param in group.parameters():
                     param.requires_grad = True
 
-        # Count trainable parameters
+        # Count trainable parameters (xKV groups are already part of model.parameters())
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        # Include xKV group parameters
-        if hasattr(self.model, "xkv_groups"):
-            for group in self.model.xkv_groups.values():
-                trainable += sum(p.numel() for p in group.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         print(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 

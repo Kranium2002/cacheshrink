@@ -103,8 +103,8 @@ def detect_attention_type(config: PretrainedConfig) -> AttentionInfo:
             attention_type=AttentionType.MHA,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
-            recommended_method="mla",
-            reason="MHA has full per-head redundancy - use per-layer MLA compression",
+            recommended_method="separate",
+            reason="MHA has full per-head redundancy - use per-layer separate compression",
         )
     elif n_kv_heads == 1:
         return AttentionInfo(
@@ -145,15 +145,15 @@ def get_compression_method(
 
     Args:
         config: HuggingFace model config
-        user_method: User-specified method ("mla", "xkv", "auto", or None)
-            - "mla": Force per-layer MLA compression
+        user_method: User-specified method ("separate", "xkv", "auto", or None)
+            - "separate": Force per-layer separate compression
             - "xkv": Force cross-layer xKV compression
             - "auto": Auto-detect and use optimal method
             - None: Same as "auto"
         verbose: Print detection info
 
     Returns:
-        Compression method to use ("mla" or "xkv")
+        Compression method to use ("separate" or "xkv")
 
     Raises:
         ValueError: If model is unsupported (native MLA) or user_method is incompatible

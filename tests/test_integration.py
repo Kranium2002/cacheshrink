@@ -289,7 +289,7 @@ class TestMLATrainer:
         ]
 
         # Train for one step
-        stats = trainer.train(
+        trainer.train(
             texts,
             num_epochs=1,
             batch_size=2,
@@ -377,7 +377,7 @@ class TestMLATrainer:
             "Machine learning is a fascinating field of study with many applications. " * 5,
         ]
 
-        stats = trainer.train(
+        trainer.train(
             texts,
             num_epochs=1,
             batch_size=2,

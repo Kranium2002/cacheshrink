@@ -91,10 +91,10 @@ def convert_to_mla(
         cross_layer_group_size: Number of layers per xKV compression group (default: 4)
         xkv_skip_early_layers: Number of early layers to skip from xKV compression.
             These layers use per-layer MLA or original attention (see keep_early_layers_original).
-            Default: 4
+            Default: 0
         keep_early_layers_original: If True, early layers (below xkv_skip_early_layers) are
             kept as original attention without any compression. If False, they use per-layer
-            MLA compression. Default: True (recommended for GQA models)
+            MLA compression. Default: False
 
     Returns:
         Tuple of (model, tokenizer) where model has MLA attention

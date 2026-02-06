@@ -169,8 +169,8 @@ def main():
             compression_ratio=COMPRESSION_RATIO,
             compression_method="auto",  # Auto-detect: uses xKV for GQA models like Qwen
             cross_layer_group_size=4,   # Layers per xKV compression group
-            xkv_skip_early_layers=0,    # Skip first 4 layers
-            keep_early_layers_original=False,  # Keep early layers as original (no compression)
+            xkv_skip_early_layers=0,    # Don't skip any early layers
+            keep_early_layers_original=False,  # All layers get xKV compression
             device=DEVICE,
             dtype=DTYPE,
             use_calibration=True,

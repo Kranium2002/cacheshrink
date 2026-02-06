@@ -1,7 +1,6 @@
 """Tests for attention type detection."""
 
 import pytest
-from unittest.mock import MagicMock
 
 from cacheshrink.attention_detection import (
     AttentionType,
@@ -47,7 +46,7 @@ class TestDetectAttentionType:
         assert info.attention_type == AttentionType.MHA
         assert info.n_heads == 32
         assert info.n_kv_heads == 32
-        assert info.recommended_method == "mla"
+        assert info.recommended_method == "separate"
         assert "MHA" in info.reason
 
     def test_mha_detection_gpt2_style(self):
@@ -58,7 +57,7 @@ class TestDetectAttentionType:
         assert info.attention_type == AttentionType.MHA
         assert info.n_heads == 12
         assert info.n_kv_heads == 12
-        assert info.recommended_method == "mla"
+        assert info.recommended_method == "separate"
 
     def test_mha_default_when_no_kv_heads(self):
         """Test that MHA is assumed when num_key_value_heads is not specified."""
@@ -127,11 +126,11 @@ class TestDetectAttentionType:
 class TestGetCompressionMethod:
     """Tests for get_compression_method function."""
 
-    def test_auto_returns_mla_for_mha(self):
-        """Test that 'auto' returns 'mla' for MHA models."""
+    def test_auto_returns_separate_for_mha(self):
+        """Test that 'auto' returns 'separate' for MHA models."""
         config = MockConfig(num_attention_heads=32, num_key_value_heads=32)
         method = get_compression_method(config, user_method="auto", verbose=False)
-        assert method == "mla"
+        assert method == "separate"
 
     def test_auto_returns_xkv_for_gqa(self):
         """Test that 'auto' returns 'xkv' for GQA models."""

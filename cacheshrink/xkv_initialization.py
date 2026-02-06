@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from .config import MLAConfig
-from .xkv_compression import XKVCompression, XKVCompressionGroup
+from .xkv_compression import XKVCompressionGroup
 
 
 def cross_layer_svd_init(

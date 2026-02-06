@@ -5,7 +5,6 @@ import torch
 
 from cacheshrink.config import MLAConfig
 from cacheshrink.xkv_compression import XKVCompression, XKVCompressionGroup
-from cacheshrink.utils import check_orthonormality
 
 
 @pytest.fixture
