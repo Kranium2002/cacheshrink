@@ -48,6 +48,21 @@ from .evaluation import (
 from .compression import MLACompression
 from .attention import MLAAttention, RotaryEmbedding, MLACache
 
+# Attention detection
+from .attention_detection import (
+    AttentionType,
+    AttentionInfo,
+    detect_attention_type,
+    get_compression_method,
+    is_gqa_model,
+    is_mqa_model,
+    is_mha_model,
+)
+
+# Cross-layer compression (xKV)
+from .xkv_compression import XKVCompression, XKVCompressionGroup
+from .xkv_initialization import cross_layer_svd_init, calibrate_xkv
+
 # Improved compression methods
 from .improved_compression import (
     JointKVCompression,
@@ -102,6 +117,19 @@ __all__ = [
     "MLAAttention",
     "RotaryEmbedding",
     "MLACache",
+    # Attention detection
+    "AttentionType",
+    "AttentionInfo",
+    "detect_attention_type",
+    "get_compression_method",
+    "is_gqa_model",
+    "is_mqa_model",
+    "is_mha_model",
+    # Cross-layer compression (xKV)
+    "XKVCompression",
+    "XKVCompressionGroup",
+    "cross_layer_svd_init",
+    "calibrate_xkv",
     # Improved compression methods
     "JointKVCompression",
     "DecoupledRoPECompression",

@@ -44,7 +44,7 @@ def main():
     print("=" * 70)
 
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
-    COMPRESSION_RATIO = 16.0
+    COMPRESSION_RATIO = 4.0
     DEVICE = "cuda"
     DTYPE = torch.float16
 
@@ -169,7 +169,7 @@ def main():
             dtype=DTYPE,
             use_calibration=True,
             calibration_dataset="wikitext",
-            calibration_config="wikitext-2-raw-v1",
+            calibration_dataset_subset="wikitext-2-raw-v1",
             num_calibration_samples=256,
             max_calibration_length=1024,
             use_randomized_svd=False,
@@ -253,7 +253,7 @@ def main():
     start_time = time.time()
     training_stats = trainer.train(
         train_texts,
-        num_epochs=40,
+        num_epochs=3,
         batch_size=4,
         max_length=MAX_LENGTH,
     )

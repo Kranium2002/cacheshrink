@@ -34,16 +34,16 @@ def get_gpu_memory():
 
 def main():
     print("=" * 70)
-    print("Qwen MLA Benchmark")
+    print("Qwen MLA Benchmark (with xKV Cross-Layer Compression)")
     print("=" * 70)
 
     # Qwen models available (no auth needed):
     # - Qwen/Qwen2.5-0.5B, Qwen/Qwen2.5-1.5B, Qwen/Qwen2.5-3B, Qwen/Qwen2.5-7B
     # - Qwen/Qwen2-0.5B, Qwen/Qwen2-1.5B, Qwen/Qwen2-7B
     MODEL_NAME = "Qwen/Qwen2.5-7B"
-    COMPRESSION_RATIO = 4.0
+    COMPRESSION_RATIO = 2.0
     DEVICE = "cuda"
-    DTYPE = torch.float16
+    DTYPE = torch.bfloat16  # bfloat16 needed for Qwen's large bias values
 
     # Dataset config
     EVAL_SAMPLES = 100
@@ -149,11 +149,11 @@ def main():
     torch.cuda.empty_cache()
     print(f"GPU memory after cleanup: {get_gpu_memory():.2f} GB")
 
-    # Model paths
+    # Model paths (include xkv in path to distinguish from per-layer MLA)
     import os
     model_short_name = MODEL_NAME.split("/")[-1].lower()
-    MLA_CONVERTED_PATH = f"./{model_short_name}-mla-{int(COMPRESSION_RATIO)}x-converted"
-    MLA_TRAINED_PATH = f"./{model_short_name}-mla-{int(COMPRESSION_RATIO)}x-trained"
+    MLA_CONVERTED_PATH = f"./{model_short_name}-xkv-{int(COMPRESSION_RATIO)}x-converted"
+    MLA_TRAINED_PATH = f"./{model_short_name}-xkv-{int(COMPRESSION_RATIO)}x-trained"
 
     if os.path.exists(MLA_CONVERTED_PATH):
         print(f"Loading existing converted model from {MLA_CONVERTED_PATH}...")
@@ -167,11 +167,15 @@ def main():
         mla_model, tokenizer = convert_to_mla(
             MODEL_NAME,
             compression_ratio=COMPRESSION_RATIO,
+            compression_method="auto",  # Auto-detect: uses xKV for GQA models like Qwen
+            cross_layer_group_size=4,   # Layers per xKV compression group
+            xkv_skip_early_layers=0,    # Skip first 4 layers
+            keep_early_layers_original=False,  # Keep early layers as original (no compression)
             device=DEVICE,
             dtype=DTYPE,
             use_calibration=True,
             calibration_dataset="wikitext",
-            calibration_config="wikitext-2-raw-v1",
+            calibration_dataset_subset="wikitext-2-raw-v1",
             num_calibration_samples=256,
             max_calibration_length=1024,
             use_randomized_svd=False,
@@ -246,13 +250,12 @@ def main():
     start_time = time.time()
     training_stats = trainer.train(
         train_texts,
-        num_epochs=40,
+        num_epochs=3,
         batch_size=4,
         max_length=MAX_LENGTH,
     )
     train_time = time.time() - start_time
     print(f"\n  Training time: {train_time:.1f}s")
-
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -322,9 +325,26 @@ def main():
     print("BENCHMARK SUMMARY")
     print("=" * 70)
 
+    # Check if xKV was used
+    use_xkv = getattr(mla_model.mla_config, 'use_cross_layer', False)
+    compression_method = mla_model.mla_config.compression_method
+    keep_early_original = getattr(mla_model.mla_config, 'keep_early_layers_original', False)
+    skip_layers = getattr(mla_model.mla_config, 'xkv_skip_early_layers', 0)
+
+    # Calculate effective compression
+    n_original_layers = skip_layers if keep_early_original else 0
+    n_compressed_layers = mla_model.mla_config.n_layers - n_original_layers
+    original_total = mla_model.mla_config.n_layers * cache_stats['config']['d_kv'] * 2
+    compressed_total = (n_original_layers * cache_stats['config']['d_kv'] * 2 +
+                        n_compressed_layers * cache_stats['config']['d_latent'] * 2)
+    effective_ratio = original_total / compressed_total
+
     print(f"""
 Model: {MODEL_NAME}
-Compression Ratio: {COMPRESSION_RATIO}x
+Compression Ratio: {COMPRESSION_RATIO}x (target)
+Compression Method: {compression_method}{' (xKV cross-layer)' if use_xkv else ''}
+{f'xKV Groups: {mla_model.mla_config.n_groups} groups of {mla_model.mla_config.cross_layer_group_size} layers' if use_xkv else ''}
+{f'Early Layers: {skip_layers} layers kept as original (no compression)' if keep_early_original and skip_layers > 0 else ''}
 
 PERPLEXITY:
   Baseline (original):     {baseline_ppl:.2f}
@@ -334,7 +354,8 @@ PERPLEXITY:
 KV CACHE COMPRESSION:
   Original KV dim:         {cache_stats['config']['d_kv'] * 2} (K: {cache_stats['config']['d_kv']}, V: {cache_stats['config']['d_kv']})
   Compressed dim:          {cache_stats['config']['d_latent'] * 2} (c_k: {cache_stats['config']['d_latent']}, c_v: {cache_stats['config']['d_latent']})
-  Actual compression:      {cache_stats['compression_ratio']:.2f}x
+  Per-layer compression:   {cache_stats['compression_ratio']:.2f}x
+  Effective compression:   {effective_ratio:.2f}x (accounting for {n_original_layers} uncompressed layers)
 
   Memory at 2048 tokens:   {cache_stats['per_sequence_length'][2048]['standard_cache_formatted']} -> {cache_stats['per_sequence_length'][2048]['mla_cache_formatted']}
   Memory saved:            {cache_stats['per_sequence_length'][2048]['memory_saved_formatted']}

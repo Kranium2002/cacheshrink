@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from cacheshrink.compression import MLACompression
+from cacheshrink.improved_compression import JointKVCompression, DecoupledRoPECompression
 from cacheshrink.utils import check_orthonormality
 
 
@@ -158,6 +159,92 @@ class TestMLACompression:
         assert id(compression.W_uv) in param_ids
 
 
+class TestMLACompressionReconstructionLoss:
+    """Tests for reconstruction loss methods in MLACompression."""
+
+    def test_has_original_weights_false_by_default(self, gpt2_config, device, dtype):
+        """Test that has_original_weights returns False by default."""
+        compression = MLACompression(gpt2_config).to(device, dtype)
+        assert compression.has_original_weights() is False
+
+    def test_store_original_weights(self, gpt2_config, device, dtype):
+        """Test that store_original_weights correctly stores weights as buffers."""
+        compression = MLACompression(gpt2_config).to(device, dtype)
+
+        # Create dummy original weights
+        W_k = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        W_v = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+
+        compression.store_original_weights(W_k, W_v)
+
+        # Check that weights are stored
+        assert compression.has_original_weights() is True
+        assert compression.W_k_original is not None
+        assert compression.W_v_original is not None
+        assert compression.W_k_original.shape == W_k.shape
+        assert compression.W_v_original.shape == W_v.shape
+
+        # Check that stored weights are detached copies (not same tensor)
+        assert not compression.W_k_original.requires_grad
+        assert not compression.W_v_original.requires_grad
+
+    def test_compute_reconstruction_loss_raises_without_weights(self, gpt2_config, device, dtype):
+        """Test that compute_reconstruction_loss raises ValueError when weights not stored."""
+        compression = MLACompression(gpt2_config).to(device, dtype)
+
+        h = torch.randn(2, 16, gpt2_config.d_model, device=device, dtype=dtype)
+
+        with pytest.raises(ValueError, match="Original weights not stored"):
+            compression.compute_reconstruction_loss(h)
+
+    def test_compute_reconstruction_loss_returns_mse(self, gpt2_config, device, dtype):
+        """Test that compute_reconstruction_loss computes MSE correctly."""
+        compression = MLACompression(gpt2_config).to(device, dtype)
+
+        # Create and store original weights
+        W_k = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        W_v = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        compression.store_original_weights(W_k, W_v)
+
+        # Initialize compression from these weights for a fair test
+        d_latent = gpt2_config.computed_d_latent
+        W_down_k = torch.randn(d_latent, gpt2_config.d_model, device=device, dtype=dtype)
+        W_down_v = torch.randn(d_latent, gpt2_config.d_model, device=device, dtype=dtype)
+        W_uk = torch.randn(gpt2_config.d_kv, d_latent, device=device, dtype=dtype)
+        W_uv = torch.randn(gpt2_config.d_kv, d_latent, device=device, dtype=dtype)
+        compression.init_from_weights(W_down_k, W_down_v, W_uk, W_uv)
+
+        h = torch.randn(2, 16, gpt2_config.d_model, device=device, dtype=dtype)
+
+        k_loss, v_loss = compression.compute_reconstruction_loss(h)
+
+        # Losses should be positive scalars
+        assert k_loss.ndim == 0  # scalar
+        assert v_loss.ndim == 0  # scalar
+        assert k_loss.item() >= 0
+        assert v_loss.item() >= 0
+
+    def test_compute_reconstruction_loss_gradients_flow(self, gpt2_config, device):
+        """Test that gradients flow through reconstruction loss computation."""
+        # Use float32 for gradient computation
+        compression = MLACompression(gpt2_config).to(device, torch.float32)
+
+        # Store original weights
+        W_k = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device)
+        W_v = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device)
+        compression.store_original_weights(W_k, W_v)
+
+        h = torch.randn(2, 16, gpt2_config.d_model, device=device, requires_grad=True)
+
+        k_loss, v_loss = compression.compute_reconstruction_loss(h)
+        total_loss = k_loss + v_loss
+        total_loss.backward()
+
+        # Check that gradients exist for compression parameters
+        assert compression.W_down_k.weight.grad is not None
+        assert compression.W_down_v.weight.grad is not None
+
+
 class TestMLACompressionGQA:
     """Tests for MLACompression with GQA configs."""
 
@@ -188,3 +275,108 @@ class TestMLACompressionGQA:
         expected_d_kv = llama_config.n_kv_heads * llama_config.d_head
         assert K.shape == (batch_size, seq_len, expected_d_kv)
         assert V.shape == (batch_size, seq_len, expected_d_kv)
+
+
+class TestJointKVCompressionReconstructionLoss:
+    """Tests for reconstruction loss methods in JointKVCompression."""
+
+    def test_has_original_weights_false_by_default(self, gpt2_config, device, dtype):
+        """Test that has_original_weights returns False by default."""
+        compression = JointKVCompression(gpt2_config).to(device, dtype)
+        assert compression.has_original_weights() is False
+
+    def test_store_original_weights(self, gpt2_config, device, dtype):
+        """Test that store_original_weights correctly stores weights as buffers."""
+        compression = JointKVCompression(gpt2_config).to(device, dtype)
+
+        W_k = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        W_v = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+
+        compression.store_original_weights(W_k, W_v)
+
+        assert compression.has_original_weights() is True
+        assert compression.W_k_original is not None
+        assert compression.W_v_original is not None
+        assert not compression.W_k_original.requires_grad
+        assert not compression.W_v_original.requires_grad
+
+    def test_compute_reconstruction_loss_raises_without_weights(self, gpt2_config, device, dtype):
+        """Test that compute_reconstruction_loss raises ValueError when weights not stored."""
+        compression = JointKVCompression(gpt2_config).to(device, dtype)
+
+        h = torch.randn(2, 16, gpt2_config.d_model, device=device, dtype=dtype)
+
+        with pytest.raises(ValueError, match="Original weights not stored"):
+            compression.compute_reconstruction_loss(h)
+
+    def test_compute_reconstruction_loss_returns_mse(self, gpt2_config, device, dtype):
+        """Test that compute_reconstruction_loss computes MSE correctly."""
+        compression = JointKVCompression(gpt2_config).to(device, dtype)
+
+        W_k = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        W_v = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        compression.store_original_weights(W_k, W_v)
+
+        h = torch.randn(2, 16, gpt2_config.d_model, device=device, dtype=dtype)
+
+        k_loss, v_loss = compression.compute_reconstruction_loss(h)
+
+        assert k_loss.ndim == 0
+        assert v_loss.ndim == 0
+        assert k_loss.item() >= 0
+        assert v_loss.item() >= 0
+
+
+class TestDecoupledRoPECompressionReconstructionLoss:
+    """Tests for reconstruction loss methods in DecoupledRoPECompression."""
+
+    @pytest.fixture
+    def decoupled_compression(self, gpt2_config, device, dtype):
+        """Create a DecoupledRoPECompression instance."""
+        # d_rope must be smaller than d_kv to leave room for d_content
+        d_rope = min(16, gpt2_config.d_kv // 2)
+        return DecoupledRoPECompression(
+            d_model=gpt2_config.d_model,
+            d_kv=gpt2_config.d_kv,
+            d_latent=gpt2_config.computed_d_latent,
+            d_rope=d_rope,
+        ).to(device, dtype)
+
+    def test_has_original_weights_false_by_default(self, decoupled_compression):
+        """Test that has_original_weights returns False by default."""
+        assert decoupled_compression.has_original_weights() is False
+
+    def test_store_original_weights(self, decoupled_compression, gpt2_config, device, dtype):
+        """Test that store_original_weights correctly stores weights as buffers."""
+        W_k = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        W_v = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+
+        decoupled_compression.store_original_weights(W_k, W_v)
+
+        assert decoupled_compression.has_original_weights() is True
+        assert decoupled_compression.W_k_original is not None
+        assert decoupled_compression.W_v_original is not None
+        assert not decoupled_compression.W_k_original.requires_grad
+        assert not decoupled_compression.W_v_original.requires_grad
+
+    def test_compute_reconstruction_loss_raises_without_weights(self, decoupled_compression, gpt2_config, device, dtype):
+        """Test that compute_reconstruction_loss raises ValueError when weights not stored."""
+        h = torch.randn(2, 16, gpt2_config.d_model, device=device, dtype=dtype)
+
+        with pytest.raises(ValueError, match="Original weights not stored"):
+            decoupled_compression.compute_reconstruction_loss(h)
+
+    def test_compute_reconstruction_loss_returns_mse(self, decoupled_compression, gpt2_config, device, dtype):
+        """Test that compute_reconstruction_loss computes MSE correctly."""
+        W_k = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        W_v = torch.randn(gpt2_config.d_kv, gpt2_config.d_model, device=device, dtype=dtype)
+        decoupled_compression.store_original_weights(W_k, W_v)
+
+        h = torch.randn(2, 16, gpt2_config.d_model, device=device, dtype=dtype)
+
+        k_loss, v_loss = decoupled_compression.compute_reconstruction_loss(h)
+
+        assert k_loss.ndim == 0
+        assert v_loss.ndim == 0
+        assert k_loss.item() >= 0
+        assert v_loss.item() >= 0

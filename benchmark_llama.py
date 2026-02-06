@@ -158,7 +158,7 @@ def main():
             dtype=DTYPE,
             use_calibration=True,
             calibration_dataset="wikitext",
-            calibration_config="wikitext-2-raw-v1",
+            calibration_dataset_subset="wikitext-2-raw-v1",
             num_calibration_samples=256,  # More calibration samples
             max_calibration_length=1024,  # Longer sequences for better SVD
             use_randomized_svd=False,  # Full SVD is more stable
@@ -232,9 +232,11 @@ def main():
     )
 
     start_time = time.time()
+    # Reconstruction loss converges faster than distillation (no teacher model drift)
+    # 3 epochs is typically sufficient; increase to 10+ for better quality if needed
     training_stats = trainer.train(
         train_texts,
-        num_epochs=3,
+        num_epochs=10,
         batch_size=2,  # Reduced for longer sequences
         max_length=MAX_LENGTH,
     )

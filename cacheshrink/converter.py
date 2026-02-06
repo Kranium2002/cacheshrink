@@ -1,6 +1,6 @@
 """Main conversion function for transforming HuggingFace models to MLA."""
 
-from typing import Tuple, Optional, List, Union, Literal
+from typing import Tuple, Optional, List, Union, Literal, Dict
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -19,7 +19,7 @@ from .improved_compression import (
 
 
 # Type alias for compression methods
-CompressionMethod = Literal["separate", "joint", "decoupled_rope"]
+CompressionMethod = Literal["separate", "joint", "decoupled_rope", "xkv", "auto"]
 
 
 def convert_to_mla(
@@ -33,13 +33,18 @@ def convert_to_mla(
     use_calibration: bool = True,
     calibration_texts: Optional[List[str]] = None,
     calibration_dataset: str = "wikitext",
-    calibration_config: str = "wikitext-2-raw-v1",
+    calibration_dataset_subset: str = "wikitext-2-raw-v1",
     num_calibration_samples: int = 128,
     max_calibration_length: int = 512,
     trust_remote_code: bool = True,
     use_randomized_svd: bool = False,
     store_original_weights: bool = False,
     verbose: bool = True,
+    # New xKV parameters
+    auto_detect: bool = False,
+    cross_layer_group_size: int = 4,
+    xkv_skip_early_layers: int = 0,
+    keep_early_layers_original: bool = False,
 ) -> Tuple[nn.Module, "AutoTokenizer"]:
     """Convert a HuggingFace model to use Multi-Head Latent Attention.
 
@@ -50,13 +55,22 @@ def convert_to_mla(
     4. Converts each attention layer to MLAAttention
     5. Initializes compression matrices using SVD
 
+    BACKWARD COMPATIBILITY:
+    - Default behavior is UNCHANGED (compression_method="separate")
+    - Existing scripts like benchmark_qwen.py work without modification
+    - Auto-detection is OPT-IN via auto_detect=True or compression_method="auto"
+
     Args:
         model_name_or_path: HuggingFace model name or path
         compression_ratio: Target KV cache compression ratio (4-16x typical)
         compression_method: Compression method to use:
-            - "separate": Separate K/V compression (default, best quality)
-            - "joint": Joint K/V with shared latent (DeepSeek-style, 2x more compression)
-            - "decoupled_rope": Decoupled RoPE (preserves positional info, best for long context)
+            EXISTING (unchanged):
+            - "separate": Per-layer separate K/V compression (default, best quality)
+            - "joint": Per-layer joint K/V with shared latent (DeepSeek-style)
+            - "decoupled_rope": Per-layer with RoPE preservation
+            NEW:
+            - "xkv": Cross-layer xKV compression (recommended for GQA models)
+            - "auto": Auto-detect and use optimal method
         d_latent: Override latent dimension (auto-computed if None)
         d_rope: RoPE dimension for decoupled_rope method (default 64)
         device: Device for the model ("cuda", "cpu", etc.)
@@ -64,7 +78,7 @@ def convert_to_mla(
         use_calibration: Whether to use calibration data for initialization
         calibration_texts: Custom texts for calibration (loads dataset if None)
         calibration_dataset: HuggingFace dataset name for calibration
-        calibration_config: Dataset configuration
+        calibration_dataset_subset: Dataset subset name (e.g., "wikitext-2-raw-v1")
         num_calibration_samples: Number of calibration samples
         max_calibration_length: Maximum sequence length for calibration
         trust_remote_code: Whether to trust remote code (needed for some models)
@@ -72,15 +86,76 @@ def convert_to_mla(
         store_original_weights: Store original W_k/W_v as frozen buffers for reconstruction
             loss during training. Required for training with use_reconstruction_loss=True.
         verbose: Whether to print progress
+        auto_detect: If True, auto-detect attention type and recommend optimal method.
+            Prints warning if current method is suboptimal. Default: False
+        cross_layer_group_size: Number of layers per xKV compression group (default: 4)
+        xkv_skip_early_layers: Number of early layers to skip from xKV compression.
+            These layers use per-layer MLA or original attention (see keep_early_layers_original).
+            Default: 4
+        keep_early_layers_original: If True, early layers (below xkv_skip_early_layers) are
+            kept as original attention without any compression. If False, they use per-layer
+            MLA compression. Default: True (recommended for GQA models)
 
     Returns:
         Tuple of (model, tokenizer) where model has MLA attention
-    """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if compression_method not in ("separate", "joint", "decoupled_rope"):
+    Raises:
+        ValueError: If auto_detect=True and model uses native MLA (already compressed)
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+    valid_methods = ("separate", "joint", "decoupled_rope", "xkv", "auto")
+    if compression_method not in valid_methods:
         raise ValueError(f"Unknown compression_method: {compression_method}. "
-                        f"Must be 'separate', 'joint', or 'decoupled_rope'")
+                        f"Must be one of {valid_methods}")
+
+    # Handle auto-detection
+    effective_method = compression_method
+    use_xkv = False
+
+    if auto_detect or compression_method == "auto":
+        from .attention_detection import detect_attention_type, AttentionType
+
+        hf_config = AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code
+        )
+        info = detect_attention_type(hf_config)
+
+        if verbose:
+            print(f"Detected attention type: {info.attention_type.value.upper()}")
+            print(f"  Heads: {info.n_heads}, KV heads: {info.n_kv_heads}")
+            print(f"  Recommended: {info.recommended_method}")
+
+        if info.recommended_method == "unsupported":
+            raise ValueError(
+                f"Model not supported for compression: {info.reason}\n"
+                f"Detected attention type: {info.attention_type.value}"
+            )
+
+        if compression_method == "auto":
+            effective_method = info.recommended_method
+            if verbose:
+                print(f"  Using auto-selected method: {effective_method}")
+        else:
+            # User specified method but also wants detection - warn if suboptimal
+            if compression_method in ["separate", "joint", "decoupled_rope"]:
+                if info.attention_type in [AttentionType.GQA, AttentionType.MQA]:
+                    print(f"WARNING: Per-layer MLA not recommended for {info.attention_type.value}")
+                    print(f"  {info.reason}")
+                    print(f"  Consider using compression_method='xkv' or 'auto' instead.")
+
+    if effective_method == "xkv":
+        use_xkv = True
+        # For xKV, use "separate" style MLAAttention but with cross-layer compression
+        effective_method = "separate"
+
+    # Validate xKV-only parameters aren't used with non-xKV methods
+    if not use_xkv and (xkv_skip_early_layers > 0 or keep_early_layers_original):
+        raise ValueError(
+            "xkv_skip_early_layers and keep_early_layers_original are only supported "
+            "with xKV compression (compression_method='xkv' or 'auto' with a GQA/MQA model). "
+            f"Current method: '{compression_method}'"
+        )
 
     # Determine device
     if device is None:
@@ -90,7 +165,7 @@ def convert_to_mla(
     # Load model and tokenizer
     if verbose:
         print(f"Loading model: {model_name_or_path}")
-        print(f"Compression method: {compression_method}")
+        print(f"Compression method: {compression_method}" + (" (xKV cross-layer)" if use_xkv else ""))
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
@@ -118,9 +193,20 @@ def convert_to_mla(
     # Store compression method in config for later use
     mla_config.compression_method = compression_method
     mla_config.d_rope = d_rope
+    mla_config.use_cross_layer = use_xkv
+    mla_config.cross_layer_group_size = cross_layer_group_size
+    mla_config.xkv_skip_early_layers = xkv_skip_early_layers
+    mla_config.keep_early_layers_original = keep_early_layers_original
 
     if verbose:
         print(f"MLA Config: {mla_config}")
+        if use_xkv:
+            print(f"xKV: {mla_config.n_groups} groups of {cross_layer_group_size} layers")
+            if xkv_skip_early_layers > 0:
+                if keep_early_layers_original:
+                    print(f"     Keeping layers 0-{xkv_skip_early_layers-1} as original (no compression)")
+                else:
+                    print(f"     Skipping first {xkv_skip_early_layers} layers (using per-layer MLA)")
 
     # Get model handler
     handler = get_handler(model, mla_config)
@@ -135,7 +221,7 @@ def convert_to_mla(
             tokenizer=tokenizer,
             texts=calibration_texts,
             dataset_name=calibration_dataset,
-            dataset_config=calibration_config,
+            dataset_config=calibration_dataset_subset,
             num_samples=num_calibration_samples,
             max_length=max_calibration_length,
             device=device,
@@ -146,6 +232,27 @@ def convert_to_mla(
     # Get attention adapter class
     adapter_class = get_attention_adapter(mla_config.model_type)
 
+    # xKV compression groups (initialized once, shared across layers)
+    xkv_groups: Optional[Dict[int, "XKVCompressionGroup"]] = None
+
+    if use_xkv:
+        # Initialize xKV compression groups using cross-layer SVD
+        from .xkv_initialization import cross_layer_svd_init
+
+        if verbose:
+            print("Initializing xKV compression groups with cross-layer SVD...")
+
+        xkv_groups = cross_layer_svd_init(
+            handler=handler,
+            config=mla_config,
+            calibration_data=calibration_data,
+            verbose=verbose,
+        )
+
+        # Store groups on model as nn.ModuleDict for proper state_dict handling
+        # This ensures shared W_uk/W_uv references are preserved during save/load
+        model.xkv_groups = nn.ModuleDict({str(k): v for k, v in xkv_groups.items()})
+
     # Convert each layer
     n_layers = handler.get_num_layers()
     iterator = range(n_layers)
@@ -153,6 +260,13 @@ def convert_to_mla(
         iterator = tqdm(iterator, desc="Converting layers")
 
     for layer_idx in iterator:
+        # Check if this is an early layer that should be kept as original
+        is_early_layer = use_xkv and not mla_config.is_xkv_layer(layer_idx)
+
+        if is_early_layer and keep_early_layers_original:
+            # Keep this layer as original attention - do not convert
+            continue
+
         # Extract original weights
         W_q, W_k, W_v, W_o = handler.extract_qkv_weights(layer_idx)
         b_q, b_k, b_v, b_o = handler.extract_qkv_biases(layer_idx)
@@ -163,29 +277,46 @@ def convert_to_mla(
             layer_calibration = calibration_data[layer_idx].to(device, dtype=W_k.dtype)
 
         # Create MLA attention module with appropriate compression
-        mla_attn = MLAAttention(mla_config, layer_idx=layer_idx, 
-                                compression_method=compression_method, d_rope=d_rope)
+        mla_attn = MLAAttention(mla_config, layer_idx=layer_idx,
+                                compression_method=effective_method, d_rope=d_rope)
 
         # Initialize compression based on method
-        if compression_method == "separate":
+        if use_xkv and mla_config.is_xkv_layer(layer_idx):
+            # Use pre-initialized xKV compression module for non-early layers
+            group_idx = mla_config.get_layer_group(layer_idx)
+            xkv_compression = model.xkv_groups[str(group_idx)].get_compression(layer_idx)
+            mla_attn.mla_compression = xkv_compression
+            # Original weights already stored during xKV init
+        elif use_xkv and not mla_config.is_xkv_layer(layer_idx):
+            # Early layer: use per-layer MLA instead of xKV (only if keep_early_layers_original=False)
             _init_separate_compression(
                 mla_attn, W_k, W_v, mla_config.computed_d_latent,
                 layer_calibration, use_randomized_svd
             )
-        elif compression_method == "joint":
+            if store_original_weights:
+                mla_attn.mla_compression.store_original_weights(W_k, W_v)
+        elif effective_method == "separate":
+            _init_separate_compression(
+                mla_attn, W_k, W_v, mla_config.computed_d_latent,
+                layer_calibration, use_randomized_svd
+            )
+            # Store original weights for reconstruction loss if requested
+            if store_original_weights:
+                mla_attn.mla_compression.store_original_weights(W_k, W_v)
+        elif effective_method == "joint":
             _init_joint_compression(
                 mla_attn, W_k, W_v, mla_config.computed_d_latent,
                 layer_calibration
             )
-        elif compression_method == "decoupled_rope":
+            if store_original_weights:
+                mla_attn.mla_compression.store_original_weights(W_k, W_v)
+        elif effective_method == "decoupled_rope":
             _init_decoupled_rope_compression(
                 mla_attn, W_k, W_v, mla_config.computed_d_latent,
                 d_rope, layer_calibration
             )
-
-        # Store original weights for reconstruction loss if requested
-        if store_original_weights:
-            mla_attn.mla_compression.store_original_weights(W_k, W_v)
+            if store_original_weights:
+                mla_attn.mla_compression.store_original_weights(W_k, W_v)
 
         # Copy Q projection weights
         mla_attn.q_proj.weight.data = W_q.clone()
@@ -220,7 +351,7 @@ def convert_to_mla(
 
     if verbose:
         print("Conversion complete!")
-        _print_compression_stats(model, mla_config, compression_method)
+        _print_compression_stats(model, mla_config, compression_method, use_xkv)
 
     return model, tokenizer
 
@@ -260,17 +391,22 @@ def _init_decoupled_rope_compression(mla_attn, W_k, W_v, d_latent, d_rope, calib
     )
 
 
-def _print_compression_stats(model: nn.Module, config: MLAConfig, method: str) -> None:
+def _print_compression_stats(
+    model: nn.Module, config: MLAConfig, method: str, use_xkv: bool = False
+) -> None:
     """Print compression statistics."""
     # Calculate cache size based on method
-    if method == "separate":
+    if use_xkv or method == "xkv":
+        compressed_dim = 2 * config.computed_d_latent
+        method_desc = f"xKV Cross-Layer ({config.n_groups} groups)"
+    elif method == "separate":
         compressed_dim = 2 * config.computed_d_latent
         method_desc = "Separate K/V"
     elif method == "joint":
         compressed_dim = config.computed_d_latent
         method_desc = "Joint K/V (DeepSeek-style)"
     elif method == "decoupled_rope":
-        d_rope = getattr(config, 'd_rope', 64)
+        d_rope = getattr(config, "d_rope", 64)
         compressed_dim = 2 * d_rope + 2 * config.computed_d_latent
         method_desc = "Decoupled RoPE"
     else:
@@ -278,12 +414,34 @@ def _print_compression_stats(model: nn.Module, config: MLAConfig, method: str) -
         method_desc = method
 
     original_kv_dim = 2 * config.d_kv
-    compression_ratio = original_kv_dim / compressed_dim
+    per_layer_compression_ratio = original_kv_dim / compressed_dim
 
     print(f"\nCompression Statistics ({method_desc}):")
     print(f"  Original KV dimension: {original_kv_dim}")
     print(f"  Compressed dimension: {compressed_dim}")
-    print(f"  Actual compression ratio: {compression_ratio:.2f}x")
+    print(f"  Per-layer compression ratio: {per_layer_compression_ratio:.2f}x")
+
+    if use_xkv:
+        print(f"  Cross-layer groups: {config.n_groups}")
+        print(f"  Layers per group: {config.cross_layer_group_size}")
+
+        # Calculate effective compression ratio considering skipped early layers
+        keep_original = getattr(config, "keep_early_layers_original", True)
+        skip_layers = getattr(config, "xkv_skip_early_layers", 0)
+
+        if keep_original and skip_layers > 0:
+            n_original_layers = skip_layers
+            n_compressed_layers = config.n_layers - skip_layers
+
+            # Total cache size: original layers use full KV, compressed use d_latent
+            total_original_kv = config.n_layers * original_kv_dim
+            total_compressed = (n_original_layers * original_kv_dim +
+                               n_compressed_layers * compressed_dim)
+            effective_ratio = total_original_kv / total_compressed
+
+            print(f"  Original layers (no compression): {n_original_layers}")
+            print(f"  Compressed layers (xKV): {n_compressed_layers}")
+            print(f"  Effective compression ratio: {effective_ratio:.2f}x")
 
     # Check orthonormality
     max_errors = []

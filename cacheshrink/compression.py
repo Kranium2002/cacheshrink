@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import geoopt
 from geoopt.manifolds import Stiefel
@@ -57,6 +57,10 @@ class MLACompression(nn.Module):
         self.register_buffer('W_k_original', None)
         self.register_buffer('W_v_original', None)
 
+        # Buffers for K/V biases (required for models like Qwen that have biases)
+        self.register_buffer('b_k', None)
+        self.register_buffer('b_v', None)
+
     def store_original_weights(self, W_k: torch.Tensor, W_v: torch.Tensor) -> None:
         """Store original K/V projection weights as frozen buffers for reconstruction loss.
 
@@ -82,10 +86,14 @@ class MLACompression(nn.Module):
         if self.W_k_original is None or self.W_v_original is None:
             raise ValueError("Original weights not stored. Call store_original_weights() first.")
 
-        # Compute targets using original weights
+        # Compute targets using original weights (including biases if present)
         h_f32 = h.float()
         K_target = torch.matmul(h_f32, self.W_k_original.float().T)
         V_target = torch.matmul(h_f32, self.W_v_original.float().T)
+        if self.b_k is not None:
+            K_target = K_target + self.b_k.float()
+        if self.b_v is not None:
+            V_target = V_target + self.b_v.float()
 
         # Compute reconstructed K/V
         c_kv = self.compress(h)
@@ -126,6 +134,9 @@ class MLACompression(nn.Module):
         """
         c_k = c_kv[..., :self.d_latent].float()
         result = torch.matmul(c_k, self.W_uk.T)
+        # Add K bias if present (critical for models like Qwen)
+        if self.b_k is not None:
+            result = result + self.b_k.to(result.device).float()
         return result.to(c_kv.dtype)
 
     def decompress_v(self, c_kv: torch.Tensor) -> torch.Tensor:
@@ -139,7 +150,22 @@ class MLACompression(nn.Module):
         """
         c_v = c_kv[..., self.d_latent:].float()
         result = torch.matmul(c_v, self.W_uv.T)
+        # Add V bias if present (critical for models like Qwen)
+        if self.b_v is not None:
+            result = result + self.b_v.to(result.device).float()
         return result.to(c_kv.dtype)
+
+    def store_biases(self, b_k: Optional[torch.Tensor], b_v: Optional[torch.Tensor]) -> None:
+        """Store K/V biases as frozen buffers.
+
+        Args:
+            b_k: Key projection bias of shape (d_kv,) or None
+            b_v: Value projection bias of shape (d_kv,) or None
+        """
+        if b_k is not None:
+            self.register_buffer("b_k", b_k.clone().detach())
+        if b_v is not None:
+            self.register_buffer("b_v", b_v.clone().detach())
 
     def decompress(self, c_kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Decompress latent representation to keys and values.

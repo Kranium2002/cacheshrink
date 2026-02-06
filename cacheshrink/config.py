@@ -1,7 +1,7 @@
 """Configuration for Multi-Head Latent Attention (MLA)."""
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import json
 
 
@@ -49,6 +49,12 @@ class MLAConfig:
     # Compression method (set by converter, affects d_latent calculation)
     compression_method: str = "separate"
     d_rope: int = 64  # RoPE dimension for decoupled_rope method
+
+    # Cross-layer compression (xKV) settings
+    use_cross_layer: bool = False  # Whether to use cross-layer xKV compression
+    cross_layer_group_size: int = 4  # Number of layers per compression group
+    xkv_skip_early_layers: int = 0  # Number of early layers to skip from xKV compression
+    keep_early_layers_original: bool = False  # Keep early layers as original attention (no compression)
 
     @property
     def d_kv(self) -> int:
@@ -104,6 +110,73 @@ class MLAConfig:
     def n_rep(self) -> int:
         """Number of times to repeat KV heads for GQA."""
         return self.n_heads // self.n_kv_heads
+
+    @property
+    def n_xkv_layers(self) -> int:
+        """Number of layers using xKV cross-layer compression."""
+        if not self.use_cross_layer:
+            return 0
+        return max(0, self.n_layers - self.xkv_skip_early_layers)
+
+    @property
+    def n_groups(self) -> int:
+        """Number of layer groups for cross-layer compression.
+
+        Only relevant when use_cross_layer is True.
+        Does not include early layers that are skipped.
+        """
+        if not self.use_cross_layer:
+            return self.n_layers
+        # Only count groups for layers after skip threshold
+        return (self.n_xkv_layers + self.cross_layer_group_size - 1) // self.cross_layer_group_size
+
+    def is_xkv_layer(self, layer_idx: int) -> bool:
+        """Check if a layer uses xKV cross-layer compression.
+
+        Early layers (below xkv_skip_early_layers) use per-layer MLA instead.
+
+        Args:
+            layer_idx: Index of the layer
+
+        Returns:
+            True if layer uses xKV, False if it uses per-layer MLA
+        """
+        if not self.use_cross_layer:
+            return False
+        return layer_idx >= self.xkv_skip_early_layers
+
+    def get_layer_group(self, layer_idx: int) -> int:
+        """Get which group a layer belongs to.
+
+        Args:
+            layer_idx: Index of the layer
+
+        Returns:
+            Group index (0-indexed), or -1 if layer is not in an xKV group
+        """
+        if not self.use_cross_layer:
+            return layer_idx
+        if layer_idx < self.xkv_skip_early_layers:
+            return -1  # Early layer, not in any xKV group
+        # Offset by skip count
+        adjusted_idx = layer_idx - self.xkv_skip_early_layers
+        return adjusted_idx // self.cross_layer_group_size
+
+    def get_group_layers(self, group_idx: int) -> List[int]:
+        """Get layer indices for a compression group.
+
+        Args:
+            group_idx: Index of the group
+
+        Returns:
+            List of layer indices in this group
+        """
+        if not self.use_cross_layer:
+            return [group_idx]
+        # Adjust for skipped early layers
+        start = group_idx * self.cross_layer_group_size + self.xkv_skip_early_layers
+        end = min(start + self.cross_layer_group_size, self.n_layers)
+        return list(range(start, end))
 
     @classmethod
     def from_pretrained(
