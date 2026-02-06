@@ -385,7 +385,8 @@ def load_mla_model(
     if unexpected_keys:
         # Filter out original weight buffers (handled separately below) and biases we handled
         real_unexpected = [k for k in unexpected_keys
-                          if "_original" not in k and not k.endswith(".bias")]
+                          if "_original" not in k and not k.endswith(".bias")
+                          and not k.endswith(".b_k") and not k.endswith(".b_v")]
         if real_unexpected:
             print(f"Warning: Unexpected keys in state dict: {real_unexpected[:5]}...")
 
