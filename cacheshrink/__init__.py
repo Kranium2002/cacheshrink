@@ -22,13 +22,16 @@ Example usage:
     model, tokenizer = load_mla_model("my-mla-model")
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # Core conversion function
 from .converter import convert_to_mla
 
 # Save/load functions
 from .saving import save_mla_model, load_mla_model
+
+# HuggingFace AutoModel integration
+from .hf_modeling import CacheShrinkModelForCausalLM
 
 # Training
 from .trainer import MLATrainer, TrainingConfig
@@ -104,6 +107,7 @@ __all__ = [
     "convert_to_mla",
     "save_mla_model",
     "load_mla_model",
+    "CacheShrinkModelForCausalLM",
     "MLATrainer",
     "TrainingConfig",
     "MLAConfig",
