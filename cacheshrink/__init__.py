@@ -22,7 +22,7 @@ Example usage:
     model, tokenizer = load_mla_model("my-mla-model")
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # Core conversion function
 from .converter import convert_to_mla
@@ -47,6 +47,21 @@ from .evaluation import (
 # Core modules (for advanced usage)
 from .compression import MLACompression
 from .attention import MLAAttention, RotaryEmbedding, MLACache
+
+# Attention detection
+from .attention_detection import (
+    AttentionType,
+    AttentionInfo,
+    detect_attention_type,
+    get_compression_method,
+    is_gqa_model,
+    is_mqa_model,
+    is_mha_model,
+)
+
+# Cross-layer compression (xKV)
+from .xkv_compression import XKVCompression, XKVCompressionGroup
+from .xkv_initialization import cross_layer_svd_init, calibrate_xkv
 
 # Improved compression methods
 from .improved_compression import (
@@ -102,6 +117,19 @@ __all__ = [
     "MLAAttention",
     "RotaryEmbedding",
     "MLACache",
+    # Attention detection
+    "AttentionType",
+    "AttentionInfo",
+    "detect_attention_type",
+    "get_compression_method",
+    "is_gqa_model",
+    "is_mqa_model",
+    "is_mha_model",
+    # Cross-layer compression (xKV)
+    "XKVCompression",
+    "XKVCompressionGroup",
+    "cross_layer_svd_init",
+    "calibrate_xkv",
     # Improved compression methods
     "JointKVCompression",
     "DecoupledRoPECompression",

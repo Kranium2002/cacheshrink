@@ -11,6 +11,7 @@ from safetensors.torch import save_file, load_file
 from .config import MLAConfig
 from .attention import MLAAttention
 from .model_handlers import get_handler, get_attention_adapter
+from .xkv_compression import XKVCompression, XKVCompressionGroup
 
 
 def save_mla_model(
@@ -104,13 +105,46 @@ def save_mla_model(
 
     # Save a marker file indicating this is an MLA model
     marker_path = os.path.join(save_directory, "mla_model_marker.json")
+    marker_data = {
+        "format_version": "1.3",  # Updated for keep_early_layers_original
+        "model_type": mla_config.model_type,
+        "compression_ratio": mla_config.compression_ratio,
+        "compression_method": mla_config.compression_method,
+        "d_latent": mla_config.computed_d_latent,
+        "use_cross_layer": mla_config.use_cross_layer,
+        "cross_layer_group_size": mla_config.cross_layer_group_size,
+        "xkv_skip_early_layers": getattr(mla_config, "xkv_skip_early_layers", 0),
+        "keep_early_layers_original": getattr(mla_config, "keep_early_layers_original", False),
+    }
     with open(marker_path, "w") as f:
-        json.dump({
-            "format_version": "1.0",
-            "model_type": mla_config.model_type,
-            "compression_ratio": mla_config.compression_ratio,
-            "d_latent": mla_config.computed_d_latent,
-        }, f, indent=2)
+        json.dump(marker_data, f, indent=2)
+
+    # If using xKV, save the xKV groups state dict separately for clarity
+    if mla_config.use_cross_layer and hasattr(model, "xkv_groups"):
+        xkv_state = {}
+        xkv_seen_data_ptrs = {}
+
+        for group_idx, group in model.xkv_groups.items():
+            group_state = group.state_dict()
+            for key, value in group_state.items():
+                if isinstance(value, torch.Tensor):
+                    tensor = value.contiguous().cpu()
+                    data_ptr = tensor.data_ptr()
+
+                    # Handle shared tensors (W_uk/W_uv are shared across layers)
+                    if data_ptr in xkv_seen_data_ptrs:
+                        tensor = tensor.clone()
+                    else:
+                        xkv_seen_data_ptrs[data_ptr] = f"xkv_group_{group_idx}.{key}"
+
+                    xkv_state[f"xkv_group_{group_idx}.{key}"] = tensor
+
+        if use_safetensors:
+            xkv_path = os.path.join(save_directory, "xkv_groups.safetensors")
+            save_file(xkv_state, xkv_path)
+        else:
+            xkv_path = os.path.join(save_directory, "xkv_groups.bin")
+            torch.save(xkv_state, xkv_path)
 
     print(f"Model saved to {save_directory}")
 
@@ -151,6 +185,16 @@ def load_mla_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Load state dict early for bias detection and later use
+    safetensors_path = os.path.join(load_directory, "model.safetensors")
+    pytorch_path = os.path.join(load_directory, "pytorch_model.bin")
+    if os.path.exists(safetensors_path):
+        state_dict_for_check = load_file(safetensors_path, device="cpu")
+    elif os.path.exists(pytorch_path):
+        state_dict_for_check = torch.load(pytorch_path, map_location="cpu")
+    else:
+        raise ValueError(f"No model weights found in {load_directory}")
+
     # Load base model architecture with empty weights for speed
     hf_config = AutoConfig.from_pretrained(load_directory, trust_remote_code=True)
     
@@ -166,13 +210,64 @@ def load_mla_model(
     handler = get_handler(model, mla_config)
     adapter_class = get_attention_adapter(mla_config.model_type)
 
+    # Check if using xKV cross-layer compression
+    use_xkv = getattr(mla_config, "use_cross_layer", False)
+
+    # For xKV, we need to create compression groups first
+    # Note: We always create on CPU (not meta) since xKV groups are small
+    # and need proper tensor storage for shared parameter references
+    xkv_groups = None
+    if use_xkv:
+        xkv_groups = {}
+        d_latent = mla_config.computed_d_latent
+        for group_idx in range(mla_config.n_groups):
+            layer_indices = mla_config.get_group_layers(group_idx)
+            group = XKVCompressionGroup(mla_config, layer_indices, d_latent)
+            xkv_groups[group_idx] = group
+
+        # CRITICAL: Register xkv_groups as part of the model BEFORE to_empty()
+        # This ensures shared W_uk/W_uv references are preserved when moving devices
+        # Without this, to_empty() creates new tensors for mla_compression.W_uk/W_uv
+        # but leaves xkv_groups.shared_W_uk/W_uv as the old tensors, breaking sharing
+        model.xkv_groups = nn.ModuleDict({str(k): v for k, v in xkv_groups.items()})
+
+    keep_early_layers_original = getattr(mla_config, "keep_early_layers_original", False)
+
     for layer_idx in range(mla_config.n_layers):
+        # Check if this is an early layer that should be kept as original
+        is_early_layer = use_xkv and not mla_config.is_xkv_layer(layer_idx)
+
+        if is_early_layer and keep_early_layers_original:
+            # Keep this layer as original attention - do not convert
+            continue
+
+        # Determine compression method for this layer
+        compression_method = mla_config.compression_method
+        if compression_method in ("xkv", "auto") and use_xkv:
+            compression_method = "separate"  # xKV uses separate-style attention
+
         # Create MLA attention
         if low_cpu_mem_usage:
             with torch.device("meta"):
-                mla_attn = MLAAttention(mla_config, layer_idx=layer_idx)
+                mla_attn = MLAAttention(
+                    mla_config,
+                    layer_idx=layer_idx,
+                    compression_method=compression_method,
+                )
         else:
-            mla_attn = MLAAttention(mla_config, layer_idx=layer_idx)
+            mla_attn = MLAAttention(
+                mla_config,
+                layer_idx=layer_idx,
+                compression_method=compression_method,
+            )
+
+        # For xKV, replace the compression module with one from the group
+        # But only for non-early layers (early layers use per-layer MLA)
+        if use_xkv and xkv_groups is not None and mla_config.is_xkv_layer(layer_idx):
+            group_idx = mla_config.get_layer_group(layer_idx)
+            # Access via the model's registered ModuleDict
+            xkv_compression = model.xkv_groups[str(group_idx)].get_compression(layer_idx)
+            mla_attn.mla_compression = xkv_compression
 
         # Wrap with adapter
         if mla_config.model_type == "gpt2":
@@ -183,37 +278,42 @@ def load_mla_model(
         # Replace in model
         handler.replace_attention(layer_idx, adapted_attn)
 
-    # Load weights directly to device
-    safetensors_path = os.path.join(load_directory, "model.safetensors")
-    pytorch_path = os.path.join(load_directory, "pytorch_model.bin")
+    # xKV groups are already registered on model as nn.ModuleDict (see earlier)
 
+    # Move state dict to target device (already loaded earlier for bias detection)
     target_device = torch.device(device)
-    
-    if os.path.exists(safetensors_path):
-        # safetensors supports loading directly to device
-        state_dict = load_file(safetensors_path, device=str(target_device))
-    elif os.path.exists(pytorch_path):
-        state_dict = torch.load(pytorch_path, map_location=target_device)
-    else:
-        raise ValueError(f"No model weights found in {load_directory}")
+    state_dict = {k: v.to(target_device) for k, v in state_dict_for_check.items()}
+    del state_dict_for_check  # Free CPU memory
+
+    # Load xKV groups state dict if it exists
+    xkv_safetensors_path = os.path.join(load_directory, "xkv_groups.safetensors")
+    xkv_pytorch_path = os.path.join(load_directory, "xkv_groups.bin")
+    xkv_state_dict = None
+
+    if os.path.exists(xkv_safetensors_path):
+        xkv_state_dict = load_file(xkv_safetensors_path, device=str(target_device))
+    elif os.path.exists(xkv_pytorch_path):
+        xkv_state_dict = torch.load(xkv_pytorch_path, map_location=target_device)
 
     # Convert dtype if needed
     if dtype is not None:
         state_dict = {k: v.to(dtype) if v.is_floating_point() else v 
                       for k, v in state_dict.items()}
 
-    # Load state dict with assign=True for meta tensors
+    # Load state dict - NOTE: we do NOT use assign=True to preserve shared parameter references
+    # (e.g., xKV's shared W_uk/W_uv across layers in a group)
     if low_cpu_mem_usage:
         # First, move the model skeleton from meta to the target device
         # to_empty() creates empty tensors on the target device
         model = model.to_empty(device=target_device)
-        
+
         # Convert dtype if needed before loading weights
         if dtype is not None:
             model = model.to(dtype)
-        
-        # Now load the weights
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False, assign=True)
+
+        # Now load the weights by copying values (NOT assign=True which breaks shared refs)
+        # to_empty() already created properly-shaped tensors, so we can copy into them
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
             
         # Re-initialize any modules that still have uninitialized tensors (like rotary embeddings)
         # These are computed buffers that need to be regenerated
@@ -222,16 +322,14 @@ def load_mla_model(
             for name, child in module.named_children():
                 fix_uninitialized_buffers(child, device, dtype_to_use)
 
-            # For rotary embeddings, recreate inv_freq and cos/sin caches
-            if hasattr(module, 'inv_freq') and module.inv_freq is not None:
-                buf = module.inv_freq
-                # Check if buffer is uninitialized (all zeros or has NaN)
-                if buf.numel() > 0 and (torch.isnan(buf).any() or (buf == 0).all()):
-                    if hasattr(module, 'dim') and hasattr(module, 'base'):
-                        dim = module.dim
-                        base = module.base
-                        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-                        module.register_buffer("inv_freq", inv_freq, persistent=False)
+            # For rotary embeddings, ALWAYS recreate inv_freq since it's computed not learned
+            # The inv_freq may have garbage values from to_empty(), not just zeros or NaN
+            if hasattr(module, 'inv_freq'):
+                if hasattr(module, 'dim') and hasattr(module, 'base'):
+                    dim = module.dim
+                    base = module.base
+                    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+                    module.register_buffer("inv_freq", inv_freq, persistent=False)
 
                 # Always regenerate cos/sin caches if the module has them
                 # These are non-persistent buffers that are never saved
@@ -245,13 +343,78 @@ def load_mla_model(
             model = model.to(dtype)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
+    # Handle bias mismatches - the saved model may have biases that the recreated model doesn't
+    # This happens because use_bias config may not match actual saved weights
+    def add_missing_bias_params(module, state_dict, prefix=""):
+        """Add missing bias parameters from state dict to Linear layers."""
+        for name, child in module.named_children():
+            child_prefix = f"{prefix}{name}."
+            add_missing_bias_params(child, state_dict, child_prefix)
+
+            # If this is a Linear layer without bias, check if state dict has one
+            if isinstance(child, nn.Linear) and child.bias is None:
+                bias_key = f"{prefix}{name}.bias"
+                if bias_key in state_dict:
+                    # Dynamically add the bias parameter
+                    bias_val = state_dict[bias_key]
+                    child.bias = nn.Parameter(bias_val.clone())
+
+    add_missing_bias_params(model, state_dict)
+
+    # Also handle the reverse - model has bias but state dict doesn't (remove bias)
+    def remove_extra_bias_params(module, state_dict, prefix=""):
+        """Remove bias parameters that aren't in state dict."""
+        for name, child in module.named_children():
+            child_prefix = f"{prefix}{name}."
+            remove_extra_bias_params(child, state_dict, child_prefix)
+
+            if isinstance(child, nn.Linear) and child.bias is not None:
+                bias_key = f"{prefix}{name}.bias"
+                if bias_key not in state_dict:
+                    # Remove the bias
+                    child.bias = None
+
+    remove_extra_bias_params(model, state_dict)
+
     if missing_keys:
-        # Filter out expected missing keys (e.g., rotary embeddings that are computed)
-        real_missing = [k for k in missing_keys if "rotary" not in k.lower()]
+        # Filter out expected missing keys (rotary embeddings, biases we handled)
+        real_missing = [k for k in missing_keys
+                        if "rotary" not in k.lower() and not k.endswith(".bias")]
         if real_missing:
             print(f"Warning: Missing keys in state dict: {real_missing[:5]}...")
     if unexpected_keys:
-        print(f"Warning: Unexpected keys in state dict: {unexpected_keys[:5]}...")
+        # Filter out original weight buffers (handled separately below) and biases we handled
+        real_unexpected = [k for k in unexpected_keys
+                          if "_original" not in k and not k.endswith(".bias")
+                          and not k.endswith(".b_k") and not k.endswith(".b_v")]
+        if real_unexpected:
+            print(f"Warning: Unexpected keys in state dict: {real_unexpected[:5]}...")
+
+    # Load xKV groups state dict if available
+    # Note: xkv_groups is now an nn.ModuleDict on the model, so shared refs are preserved
+    if use_xkv and hasattr(model, 'xkv_groups') and xkv_state_dict is not None:
+        for group_idx_str, group in model.xkv_groups.items():
+            group_idx = int(group_idx_str)
+            # Extract state dict for this group
+            group_prefix = f"xkv_group_{group_idx}."
+            group_state = {
+                k.replace(group_prefix, ""): v
+                for k, v in xkv_state_dict.items()
+                if k.startswith(group_prefix)
+            }
+            if group_state:
+                # Move state dict to target device
+                group_state = {
+                    k: v.to(target_device) for k, v in group_state.items()
+                }
+                # Apply dtype conversion if needed (but keep manifold params float32)
+                if dtype is not None:
+                    group_state = {
+                        k: v.to(dtype) if v.is_floating_point() and "shared_W" not in k else v
+                        for k, v in group_state.items()
+                    }
+                # Load the state dict into the group
+                group.load_state_dict(group_state, strict=False)
 
     # Ensure MLA compression module parameters are always float32
     # This is required for Riemannian optimization and numerical stability
@@ -275,6 +438,18 @@ def load_mla_model(
                 if child.W_uv.dtype != torch.float32:
                     child.W_uv.data = child.W_uv.data.float()
 
+            # Handle XKVCompression modules
+            if isinstance(child, XKVCompression):
+                if child.W_down_k.weight.dtype != torch.float32:
+                    child.W_down_k.weight.data = child.W_down_k.weight.data.float()
+                if child.W_down_v.weight.dtype != torch.float32:
+                    child.W_down_v.weight.data = child.W_down_v.weight.data.float()
+                # W_uk, W_uv are shared references - handled at group level
+                if child.W_uk.dtype != torch.float32:
+                    child.W_uk.data = child.W_uk.data.float()
+                if child.W_uv.dtype != torch.float32:
+                    child.W_uv.data = child.W_uv.data.float()
+
             # Also handle improved compression modules
             if hasattr(child, 'W_down') and hasattr(child, 'W_uk') and hasattr(child, 'W_uv'):
                 if child.W_down.weight.dtype != torch.float32:
@@ -291,6 +466,61 @@ def load_mla_model(
                     param.data = param.data.float()
 
     ensure_compression_params_float32(model)
+
+    # Also ensure xKV groups have float32 manifold parameters
+    if use_xkv and hasattr(model, 'xkv_groups'):
+        for group in model.xkv_groups.values():
+            if group.shared_W_uk.dtype != torch.float32:
+                group.shared_W_uk.data = group.shared_W_uk.data.float()
+            if group.shared_W_uv.dtype != torch.float32:
+                group.shared_W_uv.data = group.shared_W_uv.data.float()
+
+    # Restore original weights buffers for reconstruction loss
+    # These buffers were registered as None initially and need to be explicitly set
+    def restore_original_weight_buffers(module, state_dict, prefix=""):
+        """Restore W_k_original and W_v_original buffers from state dict."""
+        from .compression import MLACompression
+        from .improved_compression import JointKVCompression, DecoupledRoPECompression
+
+        for name, child in module.named_children():
+            child_prefix = f"{prefix}{name}."
+            restore_original_weight_buffers(child, state_dict, child_prefix)
+
+            # Check if this is a compression module with original weight buffers
+            if isinstance(child, (MLACompression, JointKVCompression, DecoupledRoPECompression, XKVCompression)):
+                w_k_key = f"{child_prefix}W_k_original"
+                w_v_key = f"{child_prefix}W_v_original"
+
+                if w_k_key in state_dict and w_v_key in state_dict:
+                    # Re-register the buffers with actual tensor values
+                    child.register_buffer('W_k_original', state_dict[w_k_key])
+                    child.register_buffer('W_v_original', state_dict[w_v_key])
+
+    restore_original_weight_buffers(model, state_dict)
+
+    # Also restore original weight buffers in xKV groups from their state dict
+    if use_xkv and hasattr(model, 'xkv_groups') and xkv_state_dict is not None:
+        for group_idx_str, group in model.xkv_groups.items():
+            group_idx = int(group_idx_str)
+            for layer_idx_str, comp in group.layer_compressions.items():
+                prefix = f"xkv_group_{group_idx}.layer_compressions.{layer_idx_str}."
+                w_k_key = f"{prefix}W_k_original"
+                w_v_key = f"{prefix}W_v_original"
+
+                if w_k_key in xkv_state_dict and w_v_key in xkv_state_dict:
+                    comp.register_buffer('W_k_original', xkv_state_dict[w_k_key].to(target_device))
+                    comp.register_buffer('W_v_original', xkv_state_dict[w_v_key].to(target_device))
+
+                # CRITICAL: Restore b_k and b_v buffers (K/V biases)
+                # These are essential for models like Qwen that have biases on k_proj/v_proj
+                # The buffers are registered as None initially, so load_state_dict can't restore them
+                b_k_key = f"{prefix}b_k"
+                b_v_key = f"{prefix}b_v"
+
+                if b_k_key in xkv_state_dict:
+                    comp.register_buffer('b_k', xkv_state_dict[b_k_key].to(target_device))
+                if b_v_key in xkv_state_dict:
+                    comp.register_buffer('b_v', xkv_state_dict[b_v_key].to(target_device))
 
     # Check for NaN/Inf in loaded weights
     def check_for_nan_inf(module, prefix=""):
@@ -310,6 +540,20 @@ def load_mla_model(
             print(f"  {issue}")
         if len(issues) > 10:
             print(f"  ... and {len(issues) - 10} more")
+
+    # Verify xKV shared tensor references are intact after loading
+    if use_xkv and hasattr(model, 'xkv_groups'):
+        for group_idx_str, group in model.xkv_groups.items():
+            for layer_idx_str, comp in group.layer_compressions.items():
+                # Verify W_uk and W_uv are the same tensor object as shared versions
+                if comp.W_uk is not group.shared_W_uk:
+                    print(f"Warning: Layer {layer_idx_str} W_uk is not shared with group {group_idx_str}")
+                    # Re-establish the reference
+                    comp.W_uk = group.shared_W_uk
+                if comp.W_uv is not group.shared_W_uv:
+                    print(f"Warning: Layer {layer_idx_str} W_uv is not shared with group {group_idx_str}")
+                    # Re-establish the reference
+                    comp.W_uv = group.shared_W_uv
 
     # Attach config
     model.mla_config = mla_config

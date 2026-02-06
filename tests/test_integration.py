@@ -289,7 +289,7 @@ class TestMLATrainer:
         ]
 
         # Train for one step
-        stats = trainer.train(
+        trainer.train(
             texts,
             num_epochs=1,
             batch_size=2,
@@ -305,5 +305,90 @@ class TestMLATrainer:
             attn = model.transformer.h[layer_idx].attn
             errors = attn.check_orthonormality()
             # Allow slightly more error after training
+            assert errors["W_uk"][0] < 1e-3
+            assert errors["W_uv"][0] < 1e-3
+
+    def test_trainer_mutual_exclusivity(self, model_name, device):
+        """Test that distillation and reconstruction loss are mutually exclusive."""
+        from cacheshrink import convert_to_mla, MLATrainer
+
+        model, tokenizer = convert_to_mla(
+            model_name,
+            compression_ratio=4.0,
+            device=device,
+            use_calibration=False,
+            store_original_weights=True,
+            verbose=False,
+        )
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            MLATrainer(
+                model, tokenizer,
+                use_distillation=True,
+                use_reconstruction_loss=True,
+            )
+
+    def test_trainer_reconstruction_loss_requires_original_weights(self, model_name, device):
+        """Test that reconstruction loss requires stored original weights."""
+        from cacheshrink import convert_to_mla, MLATrainer
+
+        # Convert without storing original weights
+        model, tokenizer = convert_to_mla(
+            model_name,
+            compression_ratio=4.0,
+            device=device,
+            use_calibration=False,
+            store_original_weights=False,
+            verbose=False,
+        )
+
+        with pytest.raises(ValueError, match="original weights"):
+            MLATrainer(
+                model, tokenizer,
+                use_distillation=False,
+                use_reconstruction_loss=True,
+            )
+
+    @pytest.mark.slow
+    def test_trainer_reconstruction_loss_one_step(self, model_name, device):
+        """Test that trainer with reconstruction loss can do one training step."""
+        from cacheshrink import convert_to_mla, MLATrainer
+
+        model, tokenizer = convert_to_mla(
+            model_name,
+            compression_ratio=4.0,
+            device=device,
+            use_calibration=False,
+            store_original_weights=True,
+            verbose=False,
+        )
+
+        trainer = MLATrainer(
+            model, tokenizer,
+            use_distillation=False,
+            use_reconstruction_loss=True,
+            reconstruction_alpha=0.3,
+        )
+
+        texts = [
+            "This is a test sentence that is long enough for the trainer to use. " * 5,
+            "Another test sentence that has sufficient length for training purposes. " * 5,
+            "The quick brown fox jumps over the lazy dog and runs away. " * 5,
+            "Machine learning is a fascinating field of study with many applications. " * 5,
+        ]
+
+        trainer.train(
+            texts,
+            num_epochs=1,
+            batch_size=2,
+            max_length=128,
+        )
+
+        assert trainer.global_step > 0
+
+        # Check orthonormality is still maintained
+        for layer_idx in range(model.mla_config.n_layers):
+            attn = model.transformer.h[layer_idx].attn
+            errors = attn.check_orthonormality()
             assert errors["W_uk"][0] < 1e-3
             assert errors["W_uv"][0] < 1e-3

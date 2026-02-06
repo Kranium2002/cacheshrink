@@ -43,10 +43,15 @@ class TrainingConfig:
     warmup_steps: int = 100
     lr_scheduler_type: str = "linear"
 
-    # Distillation settings (RECOMMENDED)
+    # Distillation settings (RECOMMENDED, mutually exclusive with reconstruction loss)
     use_distillation: bool = True  # Use knowledge distillation from original model
     distillation_temperature: float = 2.0  # Temperature for softmax in distillation
     distillation_alpha: float = 0.9  # Weight of distillation loss (1-alpha for LM loss)
+
+    # Reconstruction loss settings (alternative to distillation, mutually exclusive)
+    # No teacher model needed - uses stored original K/V weights instead
+    use_reconstruction_loss: bool = False  # Use direct K/V reconstruction loss
+    reconstruction_alpha: float = 0.3  # Weight of reconstruction loss (blended with LM loss)
 
     # Logging and saving
     logging_steps: int = 10
@@ -154,6 +159,8 @@ class MLATrainer:
         riemannian_lr: float = 1e-4,
         teacher_model: Optional[nn.Module] = None,
         use_distillation: bool = True,
+        use_reconstruction_loss: bool = False,
+        reconstruction_alpha: float = 0.3,
         save_steps: int = 0,
     ):
         """Initialize trainer.
@@ -167,6 +174,10 @@ class MLATrainer:
             teacher_model: Original (non-MLA) model for distillation. If None and
                 use_distillation=True, will load from mla_config.model_name
             use_distillation: Whether to use knowledge distillation (RECOMMENDED)
+            use_reconstruction_loss: Whether to use direct K/V reconstruction loss.
+                Requires model to have original weights stored (store_original_weights=True
+                during conversion).
+            reconstruction_alpha: Weight of reconstruction loss (0.0-1.0)
             save_steps: Save checkpoint every N steps (0 = disabled)
         """
         self.model = model
@@ -177,6 +188,8 @@ class MLATrainer:
                 euclidean_lr=euclidean_lr,
                 riemannian_lr=riemannian_lr,
                 use_distillation=use_distillation,
+                use_reconstruction_loss=use_reconstruction_loss,
+                reconstruction_alpha=reconstruction_alpha,
                 save_steps=save_steps,
             )
         self.config = config
@@ -185,6 +198,14 @@ class MLATrainer:
         if not hasattr(model, "mla_config"):
             raise ValueError("Model does not have mla_config attribute")
         self.mla_config = model.mla_config
+
+        # Validate mutually exclusive loss options
+        if self.config.use_distillation and self.config.use_reconstruction_loss:
+            raise ValueError(
+                "use_distillation and use_reconstruction_loss are mutually exclusive. "
+                "Choose one training approach: knowledge distillation (requires teacher model) "
+                "or reconstruction loss (requires stored original weights)."
+            )
 
         # Setup device
         self.device = next(model.parameters()).device
@@ -203,12 +224,17 @@ class MLATrainer:
         # Setup optimizers
         self._setup_optimizers()
 
+        # Validate reconstruction loss setup
+        if self.config.use_reconstruction_loss:
+            self._validate_reconstruction_loss_setup()
+
         # Training state
         self.global_step = 0
         self.training_stats = {
             "train_loss": [],
             "distillation_loss": [],
             "lm_loss": [],
+            "reconstruction_loss": [],
             "orthonormality_errors": [],
             "learning_rates": [],
         }
@@ -242,42 +268,76 @@ class MLATrainer:
             else:
                 param.requires_grad = False
 
-        # Count trainable parameters
+        # Also enable gradients for xKV group parameters if present
+        if hasattr(self.model, "xkv_groups"):
+            for group in self.model.xkv_groups.values():
+                for param in group.parameters():
+                    param.requires_grad = True
+
+        # Count trainable parameters (xKV groups are already part of model.parameters())
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.model.parameters())
         print(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     def _setup_optimizers(self):
-        """Setup separate optimizers for Euclidean and manifold parameters."""
+        """Setup separate optimizers for Euclidean and manifold parameters.
+
+        For xKV models, the shared manifold parameters (shared_W_uk, shared_W_uv)
+        are collected from xKV groups instead of individual layers.
+        """
         self.euclidean_params = []
         self.manifold_params = []
 
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
+        # Track which parameters we've already added (for xKV shared params)
+        added_param_ids = set()
 
-            if "W_down" in name:
-                self.euclidean_params.append(param)
-            elif "W_uk" in name or "W_uv" in name:
-                # Ensure param is a ManifoldParameter on Stiefel manifold
-                # This is needed because loading from disk loses ManifoldParameter type
-                if not isinstance(param, geoopt.ManifoldParameter):
-                    # Convert to ManifoldParameter
-                    stiefel = geoopt.manifolds.Stiefel()
-                    manifold_param = geoopt.ManifoldParameter(param.data, manifold=stiefel)
-                    manifold_param.requires_grad = True
-                    # Replace in model
-                    parts = name.split('.')
-                    obj = self.model
-                    for part in parts[:-1]:
-                        obj = getattr(obj, part)
-                    setattr(obj, parts[-1], manifold_param)
-                    self.manifold_params.append(manifold_param)
-                else:
-                    self.manifold_params.append(param)
+        # Check if model uses xKV compression
+        use_xkv = hasattr(self.model, "xkv_groups") and self.model.xkv_groups
+
+        if use_xkv:
+            # For xKV, get params from compression groups (shared params only once)
+            for group in self.model.xkv_groups.values():
+                # Shared manifold params (only once per group)
+                for param in group.get_manifold_params():
+                    if id(param) not in added_param_ids:
+                        self.manifold_params.append(param)
+                        added_param_ids.add(id(param))
+
+                # Per-layer Euclidean params
+                for param in group.get_euclidean_params():
+                    if id(param) not in added_param_ids:
+                        self.euclidean_params.append(param)
+                        added_param_ids.add(id(param))
+        else:
+            # Standard per-layer MLA
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+
+                if "W_down" in name:
+                    self.euclidean_params.append(param)
+                elif "W_uk" in name or "W_uv" in name:
+                    # Ensure param is a ManifoldParameter on Stiefel manifold
+                    # This is needed because loading from disk loses ManifoldParameter type
+                    if not isinstance(param, geoopt.ManifoldParameter):
+                        # Convert to ManifoldParameter
+                        stiefel = geoopt.manifolds.Stiefel()
+                        manifold_param = geoopt.ManifoldParameter(param.data, manifold=stiefel)
+                        manifold_param.requires_grad = True
+                        # Replace in model
+                        parts = name.split(".")
+                        obj = self.model
+                        for part in parts[:-1]:
+                            obj = getattr(obj, part)
+                        setattr(obj, parts[-1], manifold_param)
+                        self.manifold_params.append(manifold_param)
+                    else:
+                        self.manifold_params.append(param)
 
         print(f"Euclidean parameters: {len(self.euclidean_params)}")
         print(f"Manifold parameters: {len(self.manifold_params)}")
+        if use_xkv:
+            print(f"  (xKV: shared manifold params across {len(self.model.xkv_groups)} groups)")
 
         # AdamW for Euclidean parameters (W_down compression matrices)
         self.euclidean_optimizer = torch.optim.AdamW(
@@ -327,6 +387,110 @@ class MLATrainer:
             errors["W_uv_mean"] /= n_layers
 
         return errors
+
+    def _validate_reconstruction_loss_setup(self) -> None:
+        """Validate that model has original weights stored for reconstruction loss.
+
+        Checks all layers to ensure consistent configuration across the model.
+        """
+        found_compression = False
+        for layer_idx in range(self.mla_config.n_layers):
+            compression = self._get_compression_module(layer_idx)
+            if compression is None:
+                continue
+            found_compression = True
+            if not compression.has_original_weights():
+                raise ValueError(
+                    f"Reconstruction loss requires original weights to be stored for all "
+                    f"compression modules, but layer {layer_idx} is missing them. "
+                    "Convert model with store_original_weights=True."
+                )
+        if not found_compression:
+            raise ValueError("Could not find any compression module in model")
+
+    def _get_compression_module(self, layer_idx: int):
+        """Get the compression module for a specific layer.
+
+        Args:
+            layer_idx: Index of the layer
+
+        Returns:
+            The compression module, or None if not found
+        """
+        if self.mla_config.model_type == "gpt2":
+            attn = self.model.transformer.h[layer_idx].attn
+        else:
+            attn = self.model.model.layers[layer_idx].self_attn
+
+        if hasattr(attn, "mla"):
+            return attn.mla.mla_compression
+        elif hasattr(attn, "mla_compression"):
+            return attn.mla_compression
+        return None
+
+    def _register_hidden_state_hooks(self) -> tuple:
+        """Register hooks to capture hidden states during forward pass.
+
+        Returns:
+            Tuple of (hidden_states_dict, hooks_list)
+            - hidden_states_dict will be populated during forward pass
+            - hooks_list contains handles to remove after use
+        """
+        hidden_states_dict = {}
+        hooks = []
+
+        def make_hook(layer_idx):
+            def hook(module, args, kwargs=None):
+                # The first argument to attention is hidden_states
+                if len(args) > 0:
+                    h = args[0]
+                else:
+                    h = kwargs.get('hidden_states', None) if kwargs else None
+                if h is not None:
+                    # Keep gradient connection for reconstruction loss
+                    hidden_states_dict[layer_idx] = h
+            return hook
+
+        # Register hooks on each attention module
+        for layer_idx in range(self.mla_config.n_layers):
+            if self.mla_config.model_type == "gpt2":
+                attn = self.model.transformer.h[layer_idx].attn
+            else:
+                attn = self.model.model.layers[layer_idx].self_attn
+
+            hook = attn.register_forward_pre_hook(make_hook(layer_idx), with_kwargs=True)
+            hooks.append(hook)
+
+        return hidden_states_dict, hooks
+
+    def _remove_hooks(self, hooks: list) -> None:
+        """Remove registered hooks."""
+        for hook in hooks:
+            hook.remove()
+
+    def _compute_reconstruction_loss(self, hidden_states_dict: Dict[int, torch.Tensor]) -> torch.Tensor:
+        """Compute average reconstruction loss across all layers.
+
+        Args:
+            hidden_states_dict: Dictionary mapping layer_idx to hidden states
+                (captured during forward pass via hooks)
+
+        Returns:
+            Average reconstruction loss (scalar tensor)
+        """
+        total_loss = 0.0
+        n_layers = 0
+
+        for layer_idx, h in hidden_states_dict.items():
+            compression = self._get_compression_module(layer_idx)
+            if compression is not None and compression.has_original_weights():
+                k_loss, v_loss = compression.compute_reconstruction_loss(h)
+                total_loss = total_loss + k_loss + v_loss
+                n_layers += 1
+
+        if n_layers > 0:
+            return total_loss / (2 * n_layers)
+        return torch.tensor(0.0, device=self.device)
 
     def train(
         self,
@@ -381,6 +545,7 @@ class MLATrainer:
             epoch_loss = 0.0
             epoch_distill_loss = 0.0
             epoch_lm_loss = 0.0
+            epoch_recon_loss = 0.0
             num_batches = 0
 
             progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
@@ -389,8 +554,18 @@ class MLATrainer:
                 # Move to device
                 batch = {k: v.to(self.device) for k, v in batch.items()}
 
-                # Forward pass
+                # Register hooks before forward pass if reconstruction loss is enabled
+                hidden_states_dict = None
+                hooks = None
+                if self.config.use_reconstruction_loss:
+                    hidden_states_dict, hooks = self._register_hidden_state_hooks()
+
+                # Forward pass (captures hidden states if hooks are registered)
                 outputs = self.model(**batch)
+
+                # Remove hooks immediately after forward pass
+                if hooks is not None:
+                    self._remove_hooks(hooks)
 
                 # Compute loss
                 if self.config.use_distillation and self.teacher_model is not None:
@@ -424,6 +599,15 @@ class MLATrainer:
                     loss = outputs.loss
                     epoch_lm_loss += loss.item()
 
+                # Add reconstruction loss if enabled (uses hidden states captured during forward pass)
+                if self.config.use_reconstruction_loss and hidden_states_dict is not None:
+                    recon_loss = self._compute_reconstruction_loss(hidden_states_dict)
+                    epoch_recon_loss += recon_loss.item()
+
+                    # Blend reconstruction loss with LM loss
+                    alpha = self.config.reconstruction_alpha
+                    loss = (1 - alpha) * loss + alpha * recon_loss
+
                 # Backward pass
                 loss.backward()
 
@@ -454,17 +638,22 @@ class MLATrainer:
                 if self.global_step % self.config.logging_steps == 0:
                     avg_loss = epoch_loss / num_batches
                     self.training_stats["train_loss"].append(avg_loss)
+
+                    postfix = {"loss": f"{avg_loss:.4f}"}
+
                     if self.config.use_distillation:
                         avg_distill = epoch_distill_loss / num_batches
                         avg_lm = epoch_lm_loss / num_batches
                         self.training_stats["distillation_loss"].append(avg_distill)
                         self.training_stats["lm_loss"].append(avg_lm)
-                        progress_bar.set_postfix({
-                            "loss": f"{avg_loss:.4f}",
-                            "distill": f"{avg_distill:.4f}"
-                        })
-                    else:
-                        progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
+                        postfix["distill"] = f"{avg_distill:.4f}"
+
+                    if self.config.use_reconstruction_loss:
+                        avg_recon = epoch_recon_loss / num_batches
+                        self.training_stats["reconstruction_loss"].append(avg_recon)
+                        postfix["recon"] = f"{avg_recon:.4f}"
+
+                    progress_bar.set_postfix(postfix)
 
                 # Check orthonormality
                 if self.global_step % self.config.check_orthonormality_steps == 0:
