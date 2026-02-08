@@ -190,8 +190,8 @@ def convert_to_mla(
         trust_remote_code=trust_remote_code,
     )
     
-    # Store compression method in config for later use
-    mla_config.compression_method = compression_method
+    # Store the *resolved* compression method (not "auto") so save/load round-trips work
+    mla_config.compression_method = effective_method
     mla_config.d_rope = d_rope
     mla_config.use_cross_layer = use_xkv
     mla_config.cross_layer_group_size = cross_layer_group_size
@@ -211,6 +211,15 @@ def convert_to_mla(
     # Get model handler
     handler = get_handler(model, mla_config)
 
+    # Auto-detect bias from actual model weights (overrides config heuristic)
+    b_q, b_k, b_v, b_o = handler.extract_qkv_biases(0)
+    detected_bias = any(b is not None for b in (b_q, b_k, b_v, b_o))
+    if detected_bias != mla_config.use_bias:
+        if verbose:
+            print(f"Auto-detected use_bias={detected_bias} from model weights "
+                  f"(config heuristic was {mla_config.use_bias})")
+        mla_config.use_bias = detected_bias
+
     # Collect calibration data if requested
     calibration_data = None
     if use_calibration:
@@ -225,6 +234,7 @@ def convert_to_mla(
             num_samples=num_calibration_samples,
             max_length=max_calibration_length,
             device=device,
+            handler=handler,
         )
         if verbose:
             print(f"Collected calibration data for {len(calibration_data)} layers")
@@ -334,7 +344,8 @@ def convert_to_mla(
             mla_attn = mla_attn.to(dtype)
 
         # Wrap with adapter for compatibility
-        if mla_config.model_type == "gpt2":
+        from .model_handlers.gpt2 import GPT2AttentionAdapter
+        if adapter_class is GPT2AttentionAdapter:
             adapted_attn = adapter_class(mla_attn)
         else:
             adapted_attn = adapter_class(mla_attn, mla_config)
@@ -342,8 +353,9 @@ def convert_to_mla(
         # Replace attention in model
         handler.replace_attention(layer_idx, adapted_attn)
 
-    # Attach MLA config to model for later use
+    # Attach MLA config and handler to model for later use
     model.mla_config = mla_config
+    model.mla_handler = handler
 
     # Clear CUDA cache if using GPU
     if device.type == "cuda":
@@ -351,7 +363,7 @@ def convert_to_mla(
 
     if verbose:
         print("Conversion complete!")
-        _print_compression_stats(model, mla_config, compression_method, use_xkv)
+        _print_compression_stats(model, mla_config, compression_method, use_xkv, handler=handler)
 
     return model, tokenizer
 
@@ -392,7 +404,8 @@ def _init_decoupled_rope_compression(mla_attn, W_k, W_v, d_latent, d_rope, calib
 
 
 def _print_compression_stats(
-    model: nn.Module, config: MLAConfig, method: str, use_xkv: bool = False
+    model: nn.Module, config: MLAConfig, method: str, use_xkv: bool = False,
+    handler=None,
 ) -> None:
     """Print compression statistics."""
     # Calculate cache size based on method
@@ -446,7 +459,10 @@ def _print_compression_stats(
     # Check orthonormality
     max_errors = []
     for layer_idx in range(config.n_layers):
-        if config.model_type == "gpt2":
+        if handler is not None:
+            layer = handler.get_layer_module(layer_idx)
+            attn = getattr(layer, handler.get_attention_attribute_name())
+        elif config.model_type == "gpt2":
             attn = model.transformer.h[layer_idx].attn
         else:
             attn = model.model.layers[layer_idx].self_attn

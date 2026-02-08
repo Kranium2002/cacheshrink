@@ -108,20 +108,45 @@ class MinimalGPT2Attention(nn.Module):
             self.c_proj.weight.data = self.c_proj.weight.data.T.contiguous()
 
 
-class MinimalLlamaAttention(nn.Module):
-    """Minimal LLaMA style attention for testing."""
 
-    def __init__(self, config: MLAConfig):
-        super().__init__()
-        self.num_heads = config.n_heads
-        self.num_key_value_heads = config.n_kv_heads
-        self.head_dim = config.d_head
-        self.hidden_size = config.d_model
+@pytest.fixture
+def generic_config():
+    """Create a minimal generic MLAConfig for testing (LLaMA-like)."""
+    return MLAConfig(
+        model_name="test-generic",
+        model_type="generic",
+        n_heads=4,
+        n_kv_heads=4,
+        d_model=64,
+        d_head=16,
+        n_layers=2,
+        compression_ratio=4.0,
+        max_position_embeddings=128,
+        vocab_size=1000,
+        use_bias=False,
+        layer_norm_eps=1e-5,
+        extra_config={"uses_rope": True},
+    )
 
-        self.q_proj = nn.Linear(config.d_model, config.n_heads * config.d_head, bias=False)
-        self.k_proj = nn.Linear(config.d_model, config.n_kv_heads * config.d_head, bias=False)
-        self.v_proj = nn.Linear(config.d_model, config.n_kv_heads * config.d_head, bias=False)
-        self.o_proj = nn.Linear(config.n_heads * config.d_head, config.d_model, bias=False)
+
+@pytest.fixture
+def generic_config_no_rope():
+    """Create a minimal generic MLAConfig without RoPE."""
+    return MLAConfig(
+        model_name="test-generic-no-rope",
+        model_type="generic",
+        n_heads=4,
+        n_kv_heads=4,
+        d_model=64,
+        d_head=16,
+        n_layers=2,
+        compression_ratio=4.0,
+        max_position_embeddings=128,
+        vocab_size=1000,
+        use_bias=True,
+        layer_norm_eps=1e-5,
+        extra_config={"uses_rope": False},
+    )
 
 
 @pytest.fixture
@@ -130,7 +155,3 @@ def minimal_gpt2_attention(gpt2_config):
     return MinimalGPT2Attention(gpt2_config)
 
 
-@pytest.fixture
-def minimal_llama_attention(llama_config):
-    """Create minimal LLaMA attention module."""
-    return MinimalLlamaAttention(llama_config)

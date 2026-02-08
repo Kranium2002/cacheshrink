@@ -185,6 +185,7 @@ def collect_calibration_data(
     max_length: int = 512,
     batch_size: int = 8,
     device: Optional[torch.device] = None,
+    handler=None,
 ) -> Dict[int, torch.Tensor]:
     """Collect calibration data (hidden states) from model.
 
@@ -248,7 +249,9 @@ def collect_calibration_data(
     # Register hooks on decoder layers (not attention) to capture hidden states
     for layer_idx in range(n_layers):
         # Find decoder layer module
-        if hasattr(model, "transformer"):
+        if handler is not None:
+            layer = handler.get_layer_module(layer_idx)
+        elif hasattr(model, "transformer"):
             # GPT-2 style
             layer = model.transformer.h[layer_idx]
         elif hasattr(model, "model"):

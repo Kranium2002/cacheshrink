@@ -1,4 +1,7 @@
-"""Benchmark LLaMA 2 7B with MLA conversion, training, and evaluation."""
+"""Benchmark LLaMA 2 7B with MLA conversion, training, and evaluation.
+
+Uses GenericHandler (no dedicated LLaMA handler — removed in favour of generic).
+"""
 
 import time
 import torch
@@ -41,7 +44,7 @@ def main():
     MODEL_NAME = "NousResearch/Llama-2-7b-hf"  # Open LLaMA 7B (no auth needed)
     COMPRESSION_RATIO = 16.0
     DEVICE = "cuda"
-    DTYPE = torch.float16
+    DTYPE = torch.bfloat16
 
     # Dataset config
     EVAL_SAMPLES = 100   # For perplexity evaluation
@@ -313,8 +316,13 @@ def main():
     max_uk_error = 0
     max_uv_error = 0
 
+    handler = getattr(mla_model, "mla_handler", None)
     for layer_idx in range(mla_model.mla_config.n_layers):
-        attn = mla_model.model.layers[layer_idx].self_attn
+        if handler is not None:
+            layer = handler.get_layer_module(layer_idx)
+            attn = getattr(layer, handler.get_attention_attribute_name())
+        else:
+            attn = mla_model.model.layers[layer_idx].self_attn
         if hasattr(attn, "mla"):
             errors = attn.mla.check_orthonormality()
             max_uk_error = max(max_uk_error, errors["W_uk"][0])
@@ -332,6 +340,7 @@ def main():
     print("=" * 70)
 
     print(f"\nModel: {MODEL_NAME}")
+    print(f"Handler: GenericHandler (auto-discovered)")
     print(f"Compression Ratio: {COMPRESSION_RATIO}x")
     print(f"\nPERPLEXITY:")
     print(f"  Baseline (original):     {baseline_ppl:.2f}")
@@ -369,9 +378,12 @@ def main():
 
     # Free model from memory
     print("Freeing trained model from memory...")
-    del mla_model
     if trainer is not None:
+        trainer.cleanup()
         del trainer
+    # Clear all local references that keep the model alive
+    del handler, attn
+    del mla_model
     gc.collect()
     torch.cuda.empty_cache()
     print(f"  GPU memory after cleanup: {get_gpu_memory():.2f} GB")
