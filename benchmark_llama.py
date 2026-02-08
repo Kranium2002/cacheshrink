@@ -141,8 +141,16 @@ def main():
     MLA_CONVERTED_PATH = "./llama-7b-mla-16x-converted"
     MLA_TRAINED_PATH = "./llama-7b-mla-16x-trained"
 
-    # Always load converted model (not trained) to ensure consistent training
-    if os.path.exists(MLA_CONVERTED_PATH):
+    already_trained = False
+
+    if os.path.exists(MLA_TRAINED_PATH):
+        print(f"Loading existing trained model from {MLA_TRAINED_PATH}...")
+        start_time = time.time()
+        mla_model, tokenizer = load_mla_model(MLA_TRAINED_PATH, device=DEVICE, dtype=DTYPE)
+        conversion_time = time.time() - start_time
+        already_trained = True
+        print(f"  Load time: {conversion_time:.1f}s")
+    elif os.path.exists(MLA_CONVERTED_PATH):
         print(f"Loading existing converted model from {MLA_CONVERTED_PATH}...")
         start_time = time.time()
         mla_model, tokenizer = load_mla_model(MLA_CONVERTED_PATH, device=DEVICE, dtype=DTYPE)
@@ -196,55 +204,64 @@ def main():
         print(f"  {seq_len:<10} {stats['standard_cache_formatted']:<12} {stats['mla_cache_formatted']:<12} "
               f"{stats['memory_saved_formatted']:<12} {stats['compression_ratio']:.2f}x")
 
-    # =========================================================================
-    # Step 4: Post-conversion perplexity (before training)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("Step 4: Post-conversion perplexity (before training)")
-    print("=" * 70)
+    pre_train_ppl = None
+    train_time = 0
+    trainer = None
 
-    start_time = time.time()
-    pre_train_ppl = compute_perplexity(
-        mla_model, tokenizer, eval_texts[:50],
-        max_length=MAX_LENGTH, batch_size=1, verbose=True
-    )
-    ppl_time = time.time() - start_time
-    print(f"  Pre-training perplexity: {pre_train_ppl:.2f}")
-    print(f"  Perplexity increase: {((pre_train_ppl / baseline_ppl) - 1) * 100:.1f}%")
-    print(f"  Evaluation time: {ppl_time:.1f}s")
+    if not already_trained:
+        # =====================================================================
+        # Step 4: Post-conversion perplexity (before training)
+        # =====================================================================
+        print("\n" + "=" * 70)
+        print("Step 4: Post-conversion perplexity (before training)")
+        print("=" * 70)
 
-    # =========================================================================
-    # Step 5: Fine-tune with Riemannian optimization + Reconstruction Loss
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("Step 5: Fine-tuning with Riemannian optimization + Reconstruction Loss")
-    print("=" * 70)
-    print("Note: Using reconstruction loss (no teacher model needed, saves memory)")
+        start_time = time.time()
+        pre_train_ppl = compute_perplexity(
+            mla_model, tokenizer, eval_texts[:50],
+            max_length=MAX_LENGTH, batch_size=1, verbose=True
+        )
+        ppl_time = time.time() - start_time
+        print(f"  Pre-training perplexity: {pre_train_ppl:.2f}")
+        print(f"  Perplexity increase: {((pre_train_ppl / baseline_ppl) - 1) * 100:.1f}%")
+        print(f"  Evaluation time: {ppl_time:.1f}s")
 
-    trainer = MLATrainer(
-        model=mla_model,
-        tokenizer=tokenizer,
-        euclidean_lr=1e-5,  # Lower LR for stability
-        riemannian_lr=1e-4,  # Lower LR for Riemannian params
-        use_distillation=False,
-        use_reconstruction_loss=True,  # Use K/V reconstruction loss
-        reconstruction_alpha=0.3,  # Weight of reconstruction loss
-    )
+        # =====================================================================
+        # Step 5: Fine-tune with Riemannian optimization + Reconstruction Loss
+        # =====================================================================
+        print("\n" + "=" * 70)
+        print("Step 5: Fine-tuning with Riemannian optimization + Reconstruction Loss")
+        print("=" * 70)
+        print("Note: Using reconstruction loss (no teacher model needed, saves memory)")
 
-    start_time = time.time()
-    # Reconstruction loss converges faster than distillation (no teacher model drift)
-    # 3 epochs is typically sufficient; increase to 10+ for better quality if needed
-    training_stats = trainer.train(
-        train_texts,
-        num_epochs=10,
-        batch_size=2,  # Reduced for longer sequences
-        max_length=MAX_LENGTH,
-    )
-    train_time = time.time() - start_time
-    print(f"\n  Training time: {train_time:.1f}s")
+        trainer = MLATrainer(
+            model=mla_model,
+            tokenizer=tokenizer,
+            euclidean_lr=1e-5,  # Lower LR for stability
+            riemannian_lr=1e-4,  # Lower LR for Riemannian params
+            use_distillation=False,
+            use_reconstruction_loss=True,  # Use K/V reconstruction loss
+            reconstruction_alpha=0.3,  # Weight of reconstruction loss
+        )
 
-    gc.collect()
-    torch.cuda.empty_cache()
+        start_time = time.time()
+        # Reconstruction loss converges faster than distillation (no teacher model drift)
+        # 3 epochs is typically sufficient; increase to 10+ for better quality if needed
+        trainer.train(
+            train_texts,
+            num_epochs=10,
+            batch_size=2,  # Reduced for longer sequences
+            max_length=MAX_LENGTH,
+        )
+        train_time = time.time() - start_time
+        print(f"\n  Training time: {train_time:.1f}s")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        print("\n" + "=" * 70)
+        print("Steps 4-5: Skipped (using existing trained model)")
+        print("=" * 70)
 
     # =========================================================================
     # Step 6: Post-training perplexity
@@ -260,7 +277,8 @@ def main():
     )
     ppl_time = time.time() - start_time
     print(f"  Post-training perplexity: {post_train_ppl:.2f}")
-    print(f"  Improvement from pre-train: {((pre_train_ppl / post_train_ppl) - 1) * 100:.1f}%")
+    if pre_train_ppl is not None:
+        print(f"  Improvement from pre-train: {((pre_train_ppl / post_train_ppl) - 1) * 100:.1f}%")
     print(f"  Evaluation time: {ppl_time:.1f}s")
 
     # =========================================================================
@@ -313,38 +331,80 @@ def main():
     print("BENCHMARK SUMMARY")
     print("=" * 70)
 
-    print(f"""
-Model: {MODEL_NAME}
-Compression Ratio: {COMPRESSION_RATIO}x
-
-PERPLEXITY:
-  Baseline (original):     {baseline_ppl:.2f}
-  After MLA conversion:    {pre_train_ppl:.2f} (+{((pre_train_ppl/baseline_ppl)-1)*100:.1f}%)
-  After fine-tuning:       {post_train_ppl:.2f} (+{((post_train_ppl/baseline_ppl)-1)*100:.1f}%)
-
-KV CACHE COMPRESSION:
-  Original KV dim:         {cache_stats['config']['d_kv'] * 2} (K: {cache_stats['config']['d_kv']}, V: {cache_stats['config']['d_kv']})
-  Compressed dim:          {cache_stats['config']['d_latent'] * 2} (c_k: {cache_stats['config']['d_latent']}, c_v: {cache_stats['config']['d_latent']})
-  Actual compression:      {cache_stats['compression_ratio']:.2f}x
-
-  Memory at 2048 tokens:   {cache_stats['per_sequence_length'][2048]['standard_cache_formatted']} -> {cache_stats['per_sequence_length'][2048]['mla_cache_formatted']}
-  Memory saved:            {cache_stats['per_sequence_length'][2048]['memory_saved_formatted']}
-
-TIMING:
-  Conversion time:         {conversion_time:.1f}s
-  Training time:           {train_time:.1f}s
-
-ORTHONORMALITY:
-  Max error:               {max(max_uk_error, max_uv_error):.2e}
-  Status:                  {'PRESERVED' if max(max_uk_error, max_uv_error) < 1e-3 else 'DRIFTED'}
-""")
+    print(f"\nModel: {MODEL_NAME}")
+    print(f"Compression Ratio: {COMPRESSION_RATIO}x")
+    print(f"\nPERPLEXITY:")
+    print(f"  Baseline (original):     {baseline_ppl:.2f}")
+    if pre_train_ppl is not None:
+        print(f"  After MLA conversion:    {pre_train_ppl:.2f} (+{((pre_train_ppl/baseline_ppl)-1)*100:.1f}%)")
+    print(f"  After fine-tuning:       {post_train_ppl:.2f} (+{((post_train_ppl/baseline_ppl)-1)*100:.1f}%)")
+    print(f"\nKV CACHE COMPRESSION:")
+    print(f"  Original KV dim:         {cache_stats['config']['d_kv'] * 2} (K: {cache_stats['config']['d_kv']}, V: {cache_stats['config']['d_kv']})")
+    print(f"  Compressed dim:          {cache_stats['config']['d_latent'] * 2} (c_k: {cache_stats['config']['d_latent']}, c_v: {cache_stats['config']['d_latent']})")
+    print(f"  Actual compression:      {cache_stats['compression_ratio']:.2f}x")
+    print(f"\n  Memory at 2048 tokens:   {cache_stats['per_sequence_length'][2048]['standard_cache_formatted']} -> {cache_stats['per_sequence_length'][2048]['mla_cache_formatted']}")
+    print(f"  Memory saved:            {cache_stats['per_sequence_length'][2048]['memory_saved_formatted']}")
+    print(f"\nTIMING:")
+    print(f"  Conversion time:         {conversion_time:.1f}s")
+    if train_time > 0:
+        print(f"  Training time:           {train_time:.1f}s")
+    print(f"\nORTHONORMALITY:")
+    print(f"  Max error:               {max(max_uk_error, max_uv_error):.2e}")
+    print(f"  Status:                  {'PRESERVED' if max(max_uk_error, max_uv_error) < 1e-3 else 'DRIFTED'}")
+    print()
 
     # =========================================================================
-    # Save trained model
+    # Save trained model (with HF AutoModel loading support)
     # =========================================================================
     print(f"Saving trained model to {MLA_TRAINED_PATH}...")
     save_mla_model(mla_model, tokenizer, MLA_TRAINED_PATH)
     print(f"Model saved to {MLA_TRAINED_PATH}")
+
+    # =========================================================================
+    # Step 9: HuggingFace AutoModel round-trip test
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 9: HuggingFace AutoModel round-trip test")
+    print("=" * 70)
+
+    # Free model from memory
+    print("Freeing trained model from memory...")
+    del mla_model
+    if trainer is not None:
+        del trainer
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"  GPU memory after cleanup: {get_gpu_memory():.2f} GB")
+
+    # Reload via standard HuggingFace API
+    print(f"\nLoading model via AutoModelForCausalLM.from_pretrained()...")
+    start_time = time.time()
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MLA_TRAINED_PATH,
+        trust_remote_code=True,
+        torch_dtype=DTYPE,
+    )
+    hf_tokenizer = AutoTokenizer.from_pretrained(MLA_TRAINED_PATH)
+    if hf_tokenizer.pad_token is None:
+        hf_tokenizer.pad_token = hf_tokenizer.eos_token
+    hf_load_time = time.time() - start_time
+    print(f"  HF load time: {hf_load_time:.1f}s")
+    print(f"  GPU memory: {get_gpu_memory():.2f} GB")
+
+    # Generate a poem about programming
+    print("\nGenerating a poem about programming...")
+    poem_prompt = "Write a short poem about programming:\n\n"
+    poem_inputs = hf_tokenizer(poem_prompt, return_tensors="pt").to(DEVICE)
+    hf_model.generation_config.pad_token_id = hf_tokenizer.eos_token_id
+    with torch.no_grad():
+        poem_output = hf_model.generate(
+            poem_inputs.input_ids,
+            max_new_tokens=200,
+            temperature=0.7,
+            do_sample=True,
+        )
+    poem_text = hf_tokenizer.decode(poem_output[0], skip_special_tokens=True)
+    print(f"\n{poem_text}")
 
     print("\nBenchmark complete!")
 
