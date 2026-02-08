@@ -265,7 +265,7 @@ def main():
         )
 
         start_time = time.time()
-        training_stats = trainer.train(
+        trainer.train(
             train_texts,
             num_epochs=3,
             batch_size=4,

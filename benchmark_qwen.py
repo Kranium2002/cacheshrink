@@ -262,7 +262,7 @@ def main():
         )
 
         start_time = time.time()
-        training_stats = trainer.train(
+        trainer.train(
             train_texts,
             num_epochs=3,
             batch_size=4,
@@ -270,6 +270,7 @@ def main():
         )
         train_time = time.time() - start_time
         print(f"\n  Training time: {train_time:.1f}s")
+
         gc.collect()
         torch.cuda.empty_cache()
     else:

@@ -247,7 +247,7 @@ def main():
         start_time = time.time()
         # Reconstruction loss converges faster than distillation (no teacher model drift)
         # 3 epochs is typically sufficient; increase to 10+ for better quality if needed
-        training_stats = trainer.train(
+        trainer.train(
             train_texts,
             num_epochs=10,
             batch_size=2,  # Reduced for longer sequences

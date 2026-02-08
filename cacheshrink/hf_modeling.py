@@ -10,7 +10,6 @@ to cacheshrink's existing load_mla_model() function.
 """
 
 import torch
-import torch.nn as nn
 from transformers import PreTrainedModel, PretrainedConfig
 
 
