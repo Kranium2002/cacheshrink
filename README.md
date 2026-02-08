@@ -566,15 +566,19 @@ Instruction-tuned variants (e.g., `Llama-2-7b-chat-hf`, `Mistral-7B-Instruct-v0.
 
 | Family | Handler | Attention Types | Notes |
 |--------|---------|----------------|-------|
-| GPT-2 | `gpt2` | MHA | Combined QKV projection, learned position embeddings |
-| LLaMA | `llama` | MHA (2-7B/13B), GQA (2-70B, 3.x) | Separate Q/K/V/O projections, RoPE |
-| Mistral | `mistral` | GQA | Same as LLaMA with sliding window attention |
-| Qwen/Qwen2 | `qwen` | GQA | Has K/V biases (handled automatically) |
+| GPT-2 | `gpt2` (dedicated) | MHA | Combined QKV projection, learned position embeddings |
+| LLaMA | `generic` | MHA (2-7B/13B), GQA (2-70B, 3.x) | Separate Q/K/V/O projections, RoPE |
+| Mistral | `generic` | GQA | Same as LLaMA with sliding window attention |
+| Qwen/Qwen2 | `generic` | GQA | Has K/V biases (handled automatically) |
+| StableLM | `generic` | GQA | Auto-discovered via GenericHandler |
+| Other | `generic` | Any | GenericHandler auto-discovers layer structure via known paths + BFS fallback |
 | DeepSeek V2 | N/A | Native MLA | Already uses MLA, not supported |
+
+GPT-2 is the only model with a dedicated handler due to its unique Conv1D-based combined QKV projection and distinct forward signature. All other architectures are handled by `GenericHandler`, which auto-discovers layer lists, attention modules, projection styles, and bias handling at init time.
 
 ### Not Supported
 
-Models that already use compressed KV caching (e.g., DeepSeek V2/V3 with native MLA) are detected and rejected with a clear error message. Models with architectures not listed above will raise an `Unknown model type` error — see [Adding New Models](#adding-new-models) to add support.
+Models that already use compressed KV caching (e.g., DeepSeek V2/V3 with native MLA) are detected and rejected with a clear error message. Unrecognized architectures fall through to `GenericHandler`, which auto-discovers the model's layer structure. If auto-discovery fails, see [Adding New Models](#adding-new-models) to add support.
 
 **Attention type glossary:**
 

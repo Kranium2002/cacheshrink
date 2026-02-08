@@ -22,7 +22,7 @@ Example usage:
     model, tokenizer = load_mla_model("my-mla-model")
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # Core conversion function
 from .converter import convert_to_mla
@@ -93,9 +93,8 @@ from .utils import (
 from .model_handlers import (
     ModelHandler,
     GPT2Handler,
-    LlamaHandler,
-    MistralHandler,
-    QwenHandler,
+    GenericHandler,
+    GenericAttentionAdapter,
     get_handler,
     register_handler,
 )
@@ -151,9 +150,8 @@ __all__ = [
     # Model handlers
     "ModelHandler",
     "GPT2Handler",
-    "LlamaHandler",
-    "MistralHandler",
-    "QwenHandler",
+    "GenericHandler",
+    "GenericAttentionAdapter",
     "get_handler",
     "register_handler",
 ]

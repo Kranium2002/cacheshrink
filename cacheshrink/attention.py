@@ -228,7 +228,8 @@ class MLAAttention(nn.Module):
         )
 
         # RoPE (for models that use it)
-        if config.model_type != "gpt2":
+        uses_rope = config.extra_config.get("uses_rope", config.model_type != "gpt2")
+        if uses_rope:
             self.rotary_emb = RotaryEmbedding(
                 dim=config.d_head,
                 max_position_embeddings=config.max_position_embeddings,

@@ -286,8 +286,8 @@ def load_mla_model(
 
         # Determine compression method for this layer
         compression_method = mla_config.compression_method
-        if compression_method in ("xkv", "auto") and use_xkv:
-            compression_method = "separate"  # xKV uses separate-style attention
+        if compression_method in ("xkv", "auto"):
+            compression_method = "separate"  # xKV and auto resolve to separate-style attention
 
         # Create MLA attention
         if low_cpu_mem_usage:
@@ -313,7 +313,8 @@ def load_mla_model(
             mla_attn.mla_compression = xkv_compression
 
         # Wrap with adapter
-        if mla_config.model_type == "gpt2":
+        from .model_handlers.gpt2 import GPT2AttentionAdapter
+        if adapter_class is GPT2AttentionAdapter:
             adapted_attn = adapter_class(mla_attn)
         else:
             adapted_attn = adapter_class(mla_attn, mla_config)
@@ -338,26 +339,40 @@ def load_mla_model(
     elif os.path.exists(xkv_pytorch_path):
         xkv_state_dict = torch.load(xkv_pytorch_path, map_location=target_device)
 
-    # Convert dtype if needed
+    # Convert dtype if needed, but keep compression params in float32
+    # (W_uk, W_uv, W_down_k, W_down_v are Stiefel/compression params that
+    # need float32 precision for orthonormality and Riemannian optimization)
+    _compression_keys = ("W_uk", "W_uv", "W_down_k.", "W_down_v.", "W_down.",
+                         "shared_W_uk", "shared_W_uv")
     if dtype is not None:
-        state_dict = {k: v.to(dtype) if v.is_floating_point() else v 
-                      for k, v in state_dict.items()}
+        state_dict = {
+            k: v.to(dtype) if v.is_floating_point()
+               and not any(ck in k for ck in _compression_keys)
+               else v
+            for k, v in state_dict.items()
+        }
 
     # Load state dict - NOTE: we do NOT use assign=True to preserve shared parameter references
     # (e.g., xKV's shared W_uk/W_uv across layers in a group)
     if low_cpu_mem_usage:
-        # First, move the model skeleton from meta to the target device
-        # to_empty() creates empty tensors on the target device
+        # Move model skeleton from meta to target device (float32 by default)
         model = model.to_empty(device=target_device)
 
-        # Convert dtype if needed before loading weights
-        if dtype is not None:
-            model = model.to(dtype)
-
-        # Now load the weights by copying values (NOT assign=True which breaks shared refs)
-        # to_empty() already created properly-shaped tensors, so we can copy into them
+        # Load weights BEFORE dtype conversion so float32 compression params
+        # are copied into float32 model params without truncation
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            
+
+        # Now selectively convert to target dtype, keeping compression params float32
+        if dtype is not None:
+            for name, param in model.named_parameters():
+                if param.is_floating_point() and param.dtype != dtype:
+                    if not any(ck in name for ck in _compression_keys):
+                        param.data = param.data.to(dtype)
+            for name, buf in model.named_buffers():
+                if buf is not None and buf.is_floating_point() and buf.dtype != dtype:
+                    if not any(ck in name for ck in _compression_keys):
+                        buf.data = buf.data.to(dtype)
+
         # Re-initialize any modules that still have uninitialized tensors (like rotary embeddings)
         # These are computed buffers that need to be regenerated
         def fix_uninitialized_buffers(module, device, dtype_to_use):
@@ -382,9 +397,17 @@ def load_mla_model(
         fix_uninitialized_buffers(model, target_device, dtype)
     else:
         model = model.to(target_device)
-        if dtype is not None:
-            model = model.to(dtype)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        # Selectively convert to target dtype, keeping compression params float32
+        if dtype is not None:
+            for name, param in model.named_parameters():
+                if param.is_floating_point() and param.dtype != dtype:
+                    if not any(ck in name for ck in _compression_keys):
+                        param.data = param.data.to(dtype)
+            for name, buf in model.named_buffers():
+                if buf is not None and buf.is_floating_point() and buf.dtype != dtype:
+                    if not any(ck in name for ck in _compression_keys):
+                        buf.data = buf.data.to(dtype)
 
     # Handle bias mismatches - the saved model may have biases that the recreated model doesn't
     # This happens because use_bias config may not match actual saved weights

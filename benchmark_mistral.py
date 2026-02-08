@@ -1,5 +1,7 @@
 """Benchmark Mistral 7B (GQA model) with MLA conversion, training, and evaluation.
 
+Uses GenericHandler (no dedicated Mistral handler — removed in favour of generic).
+
 Mistral 7B uses Grouped Query Attention:
 - 32 query heads
 - 8 KV heads (4x repetition)
@@ -46,7 +48,7 @@ def main():
     MODEL_NAME = "mistralai/Mistral-7B-v0.1"
     COMPRESSION_RATIO = 4.0
     DEVICE = "cuda"
-    DTYPE = torch.float16
+    DTYPE = torch.bfloat16
 
     # Dataset config
     EVAL_SAMPLES = 100
@@ -330,8 +332,13 @@ def main():
     max_uk_error = 0
     max_uv_error = 0
 
+    handler = getattr(mla_model, "mla_handler", None)
     for layer_idx in range(mla_model.mla_config.n_layers):
-        attn = mla_model.model.layers[layer_idx].self_attn
+        if handler is not None:
+            layer = handler.get_layer_module(layer_idx)
+            attn = getattr(layer, handler.get_attention_attribute_name())
+        else:
+            attn = mla_model.model.layers[layer_idx].self_attn
         if hasattr(attn, "mla"):
             errors = attn.mla.check_orthonormality()
             max_uk_error = max(max_uk_error, errors["W_uk"][0])
@@ -349,6 +356,7 @@ def main():
     print("=" * 70)
 
     print(f"\nModel: {MODEL_NAME}")
+    print(f"Handler: GenericHandler (auto-discovered)")
     print(f"Attention Type: GQA ({mla_model.mla_config.n_heads} query heads, {mla_model.mla_config.n_kv_heads} KV heads)")
     print(f"Compression Ratio: {COMPRESSION_RATIO}x")
     print(f"\nPERPLEXITY:")
@@ -389,9 +397,12 @@ def main():
 
     # Free model from memory
     print("Freeing trained model from memory...")
-    del mla_model
     if trainer is not None:
+        trainer.cleanup()
         del trainer
+    # Clear all local references that keep the model alive
+    del handler, attn
+    del mla_model
     gc.collect()
     torch.cuda.empty_cache()
     print(f"  GPU memory after cleanup: {get_gpu_memory():.2f} GB")
@@ -413,7 +424,7 @@ def main():
 
     # Generate a poem about programming
     print("\nGenerating a poem about programming...")
-    poem_prompt = "Explain attention in ml models in short\n\n"
+    poem_prompt = "Explain how does a dc motor works:\n\n"
     poem_inputs = hf_tokenizer(poem_prompt, return_tensors="pt").to(DEVICE)
     hf_model.generation_config.pad_token_id = hf_tokenizer.eos_token_id
     with torch.no_grad():

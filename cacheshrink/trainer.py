@@ -354,17 +354,25 @@ class MLATrainer:
             weight_decay=self.config.riemannian_weight_decay,
         )
 
+    def _get_attention_module_for_layer(self, layer_idx: int) -> Optional[nn.Module]:
+        """Get the attention module for a specific layer.
+
+        Uses mla_handler if available, falls back to hardcoded paths.
+        """
+        if hasattr(self.model, "mla_handler") and self.model.mla_handler is not None:
+            return self.model.mla_handler.get_attention_module(layer_idx)
+        elif self.mla_config.model_type == "gpt2":
+            return self.model.transformer.h[layer_idx].attn
+        else:
+            return self.model.model.layers[layer_idx].self_attn
+
     def _get_orthonormality_errors(self) -> Dict[str, float]:
         """Check orthonormality across all layers."""
         errors = {"W_uk_max": 0.0, "W_uv_max": 0.0, "W_uk_mean": 0.0, "W_uv_mean": 0.0}
         n_layers = 0
 
         for layer_idx in range(self.mla_config.n_layers):
-            # Find attention module
-            if self.mla_config.model_type == "gpt2":
-                attn = self.model.transformer.h[layer_idx].attn
-            else:
-                attn = self.model.model.layers[layer_idx].self_attn
+            attn = self._get_attention_module_for_layer(layer_idx)
 
             # Get MLA compression module
             if hasattr(attn, "mla"):
@@ -417,10 +425,7 @@ class MLATrainer:
         Returns:
             The compression module, or None if not found
         """
-        if self.mla_config.model_type == "gpt2":
-            attn = self.model.transformer.h[layer_idx].attn
-        else:
-            attn = self.model.model.layers[layer_idx].self_attn
+        attn = self._get_attention_module_for_layer(layer_idx)
 
         if hasattr(attn, "mla"):
             return attn.mla.mla_compression
@@ -453,10 +458,7 @@ class MLATrainer:
 
         # Register hooks on each attention module
         for layer_idx in range(self.mla_config.n_layers):
-            if self.mla_config.model_type == "gpt2":
-                attn = self.model.transformer.h[layer_idx].attn
-            else:
-                attn = self.model.model.layers[layer_idx].self_attn
+            attn = self._get_attention_module_for_layer(layer_idx)
 
             hook = attn.register_forward_pre_hook(make_hook(layer_idx), with_kwargs=True)
             hooks.append(hook)
@@ -705,6 +707,29 @@ class MLATrainer:
         )
 
         print(f"Saved checkpoint to {checkpoint_dir}")
+
+    def cleanup(self):
+        """Release optimizer states and internal references to free GPU memory.
+
+        Call this before deleting the trainer to ensure all CUDA tensors are freed.
+        """
+        # Clear optimizer states (momentum + variance buffers on GPU)
+        if hasattr(self, "euclidean_optimizer"):
+            self.euclidean_optimizer.state.clear()
+        if hasattr(self, "riemannian_optimizer"):
+            self.riemannian_optimizer.state.clear()
+
+        # Drop parameter lists
+        self.euclidean_params = []
+        self.manifold_params = []
+
+        # Drop teacher model
+        if self.teacher_model is not None:
+            del self.teacher_model
+            self.teacher_model = None
+
+        # Drop model reference (caller may still hold their own ref)
+        self.model = None
 
     def load_checkpoint(self, checkpoint_dir: str):
         """Load a training checkpoint."""

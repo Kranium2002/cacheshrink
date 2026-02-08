@@ -1,4 +1,7 @@
-"""Benchmark Qwen model with MLA conversion, training, and evaluation."""
+"""Benchmark Qwen model with MLA conversion, training, and evaluation.
+
+Uses GenericHandler (no dedicated Qwen handler — removed in favour of generic).
+"""
 
 import time
 import torch
@@ -327,8 +330,13 @@ def main():
     max_uk_error = 0
     max_uv_error = 0
 
+    handler = getattr(mla_model, "mla_handler", None)
     for layer_idx in range(mla_model.mla_config.n_layers):
-        attn = mla_model.model.layers[layer_idx].self_attn
+        if handler is not None:
+            layer = handler.get_layer_module(layer_idx)
+            attn = getattr(layer, handler.get_attention_attribute_name())
+        else:
+            attn = mla_model.model.layers[layer_idx].self_attn
         if hasattr(attn, "mla"):
             errors = attn.mla.check_orthonormality()
             max_uk_error = max(max_uk_error, errors["W_uk"][0])
@@ -360,6 +368,7 @@ def main():
     effective_ratio = original_total / compressed_total
 
     print(f"\nModel: {MODEL_NAME}")
+    print(f"Handler: GenericHandler (auto-discovered)")
     print(f"Compression Ratio: {COMPRESSION_RATIO}x (target)")
     print(f"Compression Method: {compression_method}{' (xKV cross-layer)' if use_xkv else ''}")
     if use_xkv:
@@ -403,9 +412,12 @@ def main():
 
     # Free model from memory
     print("Freeing trained model from memory...")
-    del mla_model
     if trainer is not None:
+        trainer.cleanup()
         del trainer
+    # Clear all local references that keep the model alive
+    del handler, attn
+    del mla_model
     gc.collect()
     torch.cuda.empty_cache()
     print(f"  GPU memory after cleanup: {get_gpu_memory():.2f} GB")

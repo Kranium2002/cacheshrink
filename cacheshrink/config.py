@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
 import json
+import warnings
 
 
 @dataclass
@@ -11,7 +12,7 @@ class MLAConfig:
 
     Attributes:
         model_name: HuggingFace model name or path
-        model_type: Type of model (gpt2, llama, mistral, qwen)
+        model_type: Type of model (gpt2, generic)
         n_heads: Number of attention heads
         n_kv_heads: Number of KV heads (< n_heads for GQA)
         d_model: Model hidden dimension
@@ -233,12 +234,6 @@ class MLAConfig:
 
         if model_type in ("gpt2",):
             return "gpt2"
-        elif model_type in ("llama",):
-            return "llama"
-        elif model_type in ("mistral",):
-            return "mistral"
-        elif model_type in ("qwen2", "qwen"):
-            return "qwen"
         else:
             # Try to infer from architecture
             architectures = getattr(hf_config, "architectures", [])
@@ -246,15 +241,14 @@ class MLAConfig:
                 arch = architectures[0].lower()
                 if "gpt2" in arch:
                     return "gpt2"
-                elif "llama" in arch:
-                    return "llama"
-                elif "mistral" in arch:
-                    return "mistral"
-                elif "qwen" in arch:
-                    return "qwen"
 
-            raise ValueError(f"Unknown model type: {model_type}. "
-                           f"Supported: gpt2, llama, mistral, qwen")
+            if model_type not in ("llama", "mistral", "qwen2", "qwen") and model_type:
+                warnings.warn(
+                    f"Unknown model type: {model_type}. "
+                    f"Falling back to generic handler. "
+                    f"Supported types with dedicated handlers: gpt2"
+                )
+            return "generic"
 
     @staticmethod
     def _extract_config(hf_config, model_type: str) -> Dict[str, Any]:
@@ -275,20 +269,73 @@ class MLAConfig:
             config["rope_theta"] = 10000.0
             config["rope_scaling"] = None
 
-        elif model_type in ("llama", "mistral", "qwen"):
-            config["n_heads"] = hf_config.num_attention_heads
-            config["n_kv_heads"] = getattr(
-                hf_config, "num_key_value_heads", hf_config.num_attention_heads
+        elif model_type == "generic":
+            # Generic fallback: try standard HF attribute names with fallbacks
+            config["n_heads"] = getattr(
+                hf_config, "num_attention_heads",
+                getattr(hf_config, "n_head", None)
             )
-            config["d_model"] = hf_config.hidden_size
-            config["d_head"] = hf_config.hidden_size // hf_config.num_attention_heads
-            config["n_layers"] = hf_config.num_hidden_layers
-            config["max_position_embeddings"] = hf_config.max_position_embeddings
-            config["vocab_size"] = hf_config.vocab_size
-            config["use_bias"] = getattr(hf_config, "attention_bias", False)
-            config["layer_norm_eps"] = hf_config.rms_norm_eps
+            if config["n_heads"] is None:
+                raise ValueError(
+                    "Cannot extract num_attention_heads from model config. "
+                    "Attributes available: " + str([a for a in dir(hf_config) if not a.startswith("_")])
+                )
+
+            config["n_kv_heads"] = getattr(
+                hf_config, "num_key_value_heads", config["n_heads"]
+            )
+
+            config["d_model"] = getattr(
+                hf_config, "hidden_size",
+                getattr(hf_config, "n_embd", None)
+            )
+            if config["d_model"] is None:
+                raise ValueError("Cannot extract hidden_size from model config.")
+
+            config["d_head"] = config["d_model"] // config["n_heads"]
+
+            config["n_layers"] = getattr(
+                hf_config, "num_hidden_layers",
+                getattr(hf_config, "n_layer", None)
+            )
+            if config["n_layers"] is None:
+                raise ValueError("Cannot extract num_hidden_layers from model config.")
+
+            config["max_position_embeddings"] = getattr(
+                hf_config, "max_position_embeddings",
+                getattr(hf_config, "n_positions", 2048)
+            )
+            config["vocab_size"] = getattr(hf_config, "vocab_size", 50257)
+            config["use_bias"] = getattr(
+                hf_config, "attention_bias",
+                getattr(hf_config, "bias", False)
+            )
+            config["layer_norm_eps"] = getattr(
+                hf_config, "rms_norm_eps",
+                getattr(hf_config, "layer_norm_epsilon",
+                        getattr(hf_config, "layer_norm_eps", 1e-5))
+            )
+
+            # RoPE detection: check for rope_theta or rotary attributes
+            has_rope = (
+                hasattr(hf_config, "rope_theta")
+                or hasattr(hf_config, "rotary_dim")
+                or hasattr(hf_config, "rotary_emb_base")
+                or hasattr(hf_config, "rope_scaling")
+            )
+            # Also check if model_type hints at RoPE usage
+            hf_model_type = getattr(hf_config, "model_type", "").lower()
+            rope_model_types = {"phi", "gemma", "stablelm", "starcoder2", "cohere"}
+            if hf_model_type in rope_model_types:
+                has_rope = True
+            # GPT-2 style models (learned position embeddings) don't use RoPE
+            if hasattr(hf_config, "n_positions") and not hasattr(hf_config, "rope_theta"):
+                has_rope = False
+
             config["rope_theta"] = getattr(hf_config, "rope_theta", 10000.0)
             config["rope_scaling"] = getattr(hf_config, "rope_scaling", None)
+
+            config["extra_config"] = {"uses_rope": has_rope}
 
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
