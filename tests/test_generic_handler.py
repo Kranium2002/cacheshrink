@@ -12,7 +12,6 @@ from cacheshrink.model_handlers import (
     GenericHandler,
     GenericAttentionAdapter,
 )
-from cacheshrink.model_handlers.generic import GenericHandler as GenericHandlerDirect
 from cacheshrink.attention import MLAAttention
 
 

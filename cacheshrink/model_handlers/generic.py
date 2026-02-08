@@ -4,7 +4,6 @@ Auto-discovers model structure (layer list, attention modules, projection style)
 at init time. Used as a fallback when no specific handler exists for the model type.
 """
 
-import warnings
 from typing import Tuple, Optional
 from collections import deque
 
@@ -211,7 +210,6 @@ class GenericHandler(ModelHandler):
             else:
                 c_attn_weight = c_attn.weight.data
 
-            d_model = self.config.d_model
             d_q = self.config.n_heads * self.config.d_head
             d_kv = self.config.d_kv
 
@@ -264,7 +262,6 @@ class GenericHandler(ModelHandler):
             return b_q, b_k, b_v, b_o
 
         elif self._proj_style == "combined":
-            is_conv1d = self._proj_info.get("is_conv1d", False)
             attr_name = self._proj_info.get("attr", "c_attn")
             c_attn = getattr(attn, attr_name)
 
@@ -334,8 +331,7 @@ class GenericHandler(ModelHandler):
 class GenericAttentionAdapter(nn.Module):
     """Adapter for MLA attention that works with any model's forward signature.
 
-    Reuses LlamaAttentionAdapter logic (DynamicCache handling, position_ids, etc.)
-    with a configurable uses_rope flag.
+    Handles DynamicCache conversion, position_ids, and different cache formats.
     """
 
     def __init__(self, mla_attention: nn.Module, config: MLAConfig):
@@ -349,7 +345,6 @@ class GenericAttentionAdapter(nn.Module):
         self.hidden_size = config.d_model
 
         self._cache_d_latent = config.computed_d_latent
-        self._uses_rope = config.extra_config.get("uses_rope", True)
 
     def _c_kv_to_cache_format(self, c_kv: torch.Tensor):
         keys = c_kv.unsqueeze(1)

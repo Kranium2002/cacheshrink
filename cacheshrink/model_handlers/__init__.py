@@ -28,10 +28,8 @@ def get_handler(model: nn.Module, config: MLAConfig) -> ModelHandler:
         config: MLA configuration
 
     Returns:
-        Model handler instance
-
-    Raises:
-        ValueError: If model type is not supported
+        Model handler instance. Falls back to GenericHandler for
+        unrecognized model types.
     """
     model_type = config.model_type
 
@@ -50,10 +48,8 @@ def get_attention_adapter(model_type: str):
         model_type: Model type string
 
     Returns:
-        Attention adapter class
-
-    Raises:
-        ValueError: If model type is not supported
+        Attention adapter class. Falls back to GenericAttentionAdapter
+        for unrecognized model types.
     """
     adapter_class = ADAPTER_REGISTRY.get(model_type)
     if adapter_class is None:

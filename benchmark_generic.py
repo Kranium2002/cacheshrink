@@ -342,6 +342,7 @@ def main():
     t0 = time.time()
     hf_model = AutoModelForCausalLM.from_pretrained(
         TRAINED, trust_remote_code=True, torch_dtype=DTYPE,
+        device_map="auto",
     )
     hf_tok = AutoTokenizer.from_pretrained(TRAINED)
     if hf_tok.pad_token is None:
@@ -365,8 +366,6 @@ def main():
     # Summary
     # ------------------------------------------------------------------
     separator("BENCHMARK SUMMARY")
-    use_xkv = getattr(mla_model if 'mla_model' in dir() else hf_model,
-                       "mla_config", None)
     print(f"  Model              : {MODEL_NAME} (1.6B params)")
     print(f"  Handler            : GenericHandler (auto-discovered)")
     print(f"  model_type         : stablelm (no dedicated handler)")

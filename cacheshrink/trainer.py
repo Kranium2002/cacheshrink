@@ -360,9 +360,7 @@ class MLATrainer:
         Uses mla_handler if available, falls back to hardcoded paths.
         """
         if hasattr(self.model, "mla_handler") and self.model.mla_handler is not None:
-            handler = self.model.mla_handler
-            layer = handler.get_layer_module(layer_idx)
-            return getattr(layer, handler.get_attention_attribute_name())
+            return self.model.mla_handler.get_attention_module(layer_idx)
         elif self.mla_config.model_type == "gpt2":
             return self.model.transformer.h[layer_idx].attn
         else:
