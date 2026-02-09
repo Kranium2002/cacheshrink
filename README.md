@@ -19,6 +19,7 @@ Achieve **2-16x KV cache compression** on LLaMA, Mistral, Qwen, GPT-2, and other
   - [Fine-tuning with Knowledge Distillation](#fine-tuning-with-knowledge-distillation)
   - [Evaluation](#evaluation)
   - [Saving and Loading](#saving-and-loading)
+  - [vLLM Serving](#vllm-serving)
 - [Parameter Reference](#parameter-reference)
 - [Training Details](#training-details)
 - [Benchmark Results](#benchmark-results)
@@ -51,11 +52,15 @@ LLaMA-2 7B at 4096 tokens (float16):
 - **Two training approaches** — reconstruction loss (no teacher model) or knowledge distillation
 - **Automatic method selection** — detects MHA/GQA/MQA and picks the optimal compression strategy
 - **Cross-layer compression (xKV)** — shared basis vectors across layer groups for GQA models
+- **vLLM serving** — serve compressed models with `vllm serve` for production throughput with smaller KV cache blocks
 
 ## Installation
 
 ```bash
 pip install cacheshrink
+
+# With vLLM serving support
+pip install cacheshrink[vllm]
 
 # For development
 git clone https://github.com/your-repo/cacheshrink
@@ -69,6 +74,7 @@ pip install -e ".[dev]"
 - PyTorch >= 2.0
 - transformers >= 4.35
 - geoopt >= 0.5 (Riemannian optimization)
+- vLLM >= 0.15 (optional, for serving)
 
 ## Quick Start
 
@@ -386,6 +392,49 @@ model, tokenizer = load_mla_model("./my-compressed-model", device="cuda", dtype=
 
 Saved files include the model weights, tokenizer, MLA config, and xKV group state (if applicable). Shared tensor references (xKV's shared W_uk/W_uv) are correctly preserved through save/load.
 
+### vLLM Serving
+
+Compressed models can be served with [vLLM](https://docs.vllm.ai/) (>= 0.15) for production inference with the KV cache compression benefit preserved. vLLM allocates smaller paged KV cache blocks, fitting more sequences in GPU memory.
+
+```python
+from cacheshrink import convert_to_mla
+from cacheshrink.vllm import save_for_vllm
+
+# 1. Convert and optionally train
+model, tokenizer = convert_to_mla(
+    "Qwen/Qwen2.5-7B-Instruct",
+    compression_ratio=4.0,
+    device="cuda",
+    dtype=torch.bfloat16,
+    use_calibration=True,
+)
+
+# 2. Save for vLLM (separate from HF save)
+save_for_vllm(model, tokenizer, "./my-model-vllm")
+```
+
+Then serve with vLLM:
+
+```bash
+vllm serve ./my-model-vllm --dtype bfloat16
+```
+
+Or use the offline `LLM` class:
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(model="./my-model-vllm", dtype="bfloat16")
+outputs = llm.generate(["The theory of relativity"], SamplingParams(max_tokens=128))
+```
+
+**How it works:** `save_for_vllm()` sets `architectures: ["CacheShrinkForCausalLM"]` in config.json so vLLM dispatches to the cacheshrink model class (registered via a plugin entry point). The config also sets `num_key_value_heads` to `d_latent // d_head`, causing vLLM to allocate smaller KV cache blocks. During inference, compressed c_kv is stored in the paged cache; decompression to full K/V happens on-the-fly during attention.
+
+**Constraints:**
+- `d_latent` must be divisible by `d_head` (true for standard compression ratios)
+- `keep_early_layers_original=True` is not supported — all layers must use MLA for uniform cache dimensions
+- Requires vLLM >= 0.15 (v1 engine API)
+
 ## Parameter Reference
 
 ### `convert_to_mla()`
@@ -616,8 +665,8 @@ Register it in `model_handlers/__init__.py` to make it available via `get_handle
 
 ## Roadmap
 
-- **HuggingFace Hub integration** — Save and load compressed models with `AutoModelForCausalLM.from_pretrained()` via `trust_remote_code=True`. Publish compressed models to the Hub for anyone to use without installing cacheshrink.
-- **vLLM support** — Custom model plugin for vLLM so compressed models can serve with PagedAttention, continuous batching, and all the production features vLLM provides.
+- ~~**HuggingFace Hub integration**~~ — Done. Save and load compressed models with `AutoModelForCausalLM.from_pretrained()` via `trust_remote_code=True`.
+- ~~**vLLM support**~~ — Done. Custom model plugin for vLLM (>= 0.15) with compressed paged KV cache blocks. See [vLLM Serving](#vllm-serving).
 - **Custom Triton kernels** — Fused compress/decompress + attention kernels to eliminate the overhead of reconstructing K/V into a separate buffer. Directly compute attention from the latent representations.
 - **Combining with KV cache quantization** — Stack dimensional compression (cacheshrink) with precision reduction (FP8/INT8) for even higher compression ratios.
 
