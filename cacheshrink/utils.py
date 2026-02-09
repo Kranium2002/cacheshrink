@@ -53,14 +53,19 @@ def orthonormalize_columns(W: torch.Tensor, method: str = "polar") -> torch.Tens
     if n > m:
         raise ValueError(f"Cannot orthonormalize columns when n > m: got shape {W.shape}")
 
+    # SVD/QR require float32 on CUDA (bfloat16 not supported)
+    orig_dtype = W.dtype
+    if W.dtype == torch.bfloat16 or W.dtype == torch.float16:
+        W = W.float()
+
     if method == "qr":
         Q, _ = torch.linalg.qr(W, mode="reduced")
-        return Q
+        return Q.to(orig_dtype)
     else:
         # Polar decomposition: find closest orthonormal matrix
         # For W = U @ S @ Vh, the closest orthonormal matrix is U @ Vh
         U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-        return U @ Vh
+        return (U @ Vh).to(orig_dtype)
 
 
 def check_orthonormality(W: torch.Tensor, mode: str = "rows") -> Tuple[float, float]:

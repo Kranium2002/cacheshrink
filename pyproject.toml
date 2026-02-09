@@ -42,12 +42,16 @@ dev = [
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
+vllm = ["vllm>=0.6.0"]
 
 [project.urls]
 Homepage = "https://github.com/cacheshrink/cacheshrink"
 Documentation = "https://github.com/cacheshrink/cacheshrink#readme"
 Repository = "https://github.com/cacheshrink/cacheshrink"
 Issues = "https://github.com/cacheshrink/cacheshrink/issues"
+
+[project.entry-points."vllm.general_plugins"]
+cacheshrink = "cacheshrink.vllm.plugin:register_cacheshrink_models"
 
 [tool.setuptools.packages.find]
 include = ["cacheshrink*"]

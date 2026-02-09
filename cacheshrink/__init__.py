@@ -99,6 +99,12 @@ from .model_handlers import (
     register_handler,
 )
 
+# Optional vLLM integration (requires vllm extra)
+try:
+    from .vllm import register_cacheshrink_models, save_for_vllm
+except ImportError:
+    pass
+
 __all__ = [
     # Version
     "__version__",
