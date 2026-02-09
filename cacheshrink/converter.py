@@ -220,6 +220,14 @@ def convert_to_mla(
                   f"(config heuristic was {mla_config.use_bias})")
         mla_config.use_bias = detected_bias
 
+    # Auto-detect qk_norm from actual model (some models like Qwen3 have it
+    # without a config flag)
+    q_norm_probe, k_norm_probe = handler.extract_qk_norms(0)
+    if q_norm_probe is not None and not mla_config.qk_norm:
+        if verbose:
+            print(f"Auto-detected qk_norm=True from model attention modules")
+        mla_config.qk_norm = True
+
     # Collect calibration data if requested
     calibration_data = None
     if use_calibration:
@@ -281,6 +289,9 @@ def convert_to_mla(
         W_q, W_k, W_v, W_o = handler.extract_qkv_weights(layer_idx)
         b_q, b_k, b_v, b_o = handler.extract_qkv_biases(layer_idx)
 
+        # Extract QK norms (e.g., Qwen3 with qk_norm=True)
+        q_norm, k_norm = handler.extract_qk_norms(layer_idx)
+
         # Get calibration data for this layer
         layer_calibration = None
         if calibration_data is not None and layer_idx in calibration_data:
@@ -327,6 +338,16 @@ def convert_to_mla(
             )
             if store_original_weights:
                 mla_attn.mla_compression.store_original_weights(W_k, W_v)
+
+        # Attach QK norms if present (frozen, not trained)
+        if q_norm is not None:
+            mla_attn.q_norm = q_norm
+            for p in mla_attn.q_norm.parameters():
+                p.requires_grad = False
+        if k_norm is not None:
+            mla_attn.k_norm = k_norm
+            for p in mla_attn.k_norm.parameters():
+                p.requires_grad = False
 
         # Copy Q projection weights
         mla_attn.q_proj.weight.data = W_q.clone()

@@ -100,7 +100,8 @@ class TestGPT2AttentionAdapter:
         assert outputs[0].shape == hidden_states.shape
 
     def test_forward_with_cache(self, gpt2_config, device, dtype):
-        """Test adapter with caching."""
+        """Test adapter with caching via DynamicCache (transformers >=5.x)."""
+        from transformers.cache_utils import DynamicCache
         from cacheshrink.attention import MLAAttention
         from cacheshrink.model_handlers.gpt2 import GPT2AttentionAdapter
 
@@ -110,8 +111,11 @@ class TestGPT2AttentionAdapter:
         batch_size, seq_len = 2, 16
         hidden_states = torch.randn(batch_size, seq_len, gpt2_config.d_model, device=device, dtype=dtype)
 
-        # First pass with cache
-        outputs = adapter(hidden_states, use_cache=True)
+        # First pass with DynamicCache
+        cache = DynamicCache()
+        outputs = adapter(hidden_states, past_key_values=cache, use_cache=True)
 
-        assert len(outputs) == 2  # (output, past)
-        assert outputs[1] is not None
+        # Returns (attn_output, attn_weights) — cache is updated in-place
+        assert len(outputs) == 2  # (output, attn_weights)
+        assert outputs[0].shape == hidden_states.shape
+        assert cache.get_seq_length() == seq_len

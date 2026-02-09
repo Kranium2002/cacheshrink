@@ -1,0 +1,548 @@
+"""Benchmark Qwen3-8B model with MLA conversion, training, and evaluation.
+
+Qwen3 uses qk_norm (RMSNorm on Q and K after projection, before RoPE).
+This benchmark verifies that cacheshrink correctly handles qk_norm models.
+"""
+
+import time
+import torch
+import gc
+from datasets import load_dataset
+
+from cacheshrink import (
+    convert_to_mla,
+    save_mla_model,
+    load_mla_model,
+    MLATrainer,
+    compute_perplexity,
+    measure_cache_memory,
+    generate_samples,
+)
+
+
+def format_memory(bytes_val):
+    """Format bytes to human readable."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if bytes_val < 1024:
+            return f"{bytes_val:.2f} {unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.2f} TB"
+
+
+def get_gpu_memory():
+    """Get current GPU memory usage."""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1024**3  # GB
+    return 0
+
+
+def main():
+    print("=" * 70)
+    print("Qwen3-8B MLA Benchmark (with QK Norm + xKV Cross-Layer Compression)")
+    print("=" * 70)
+
+    MODEL_NAME = "Qwen/Qwen3-8B"
+    COMPRESSION_RATIO = 4.0
+    DEVICE = "cuda"
+    DTYPE = torch.bfloat16
+
+    # Dataset config
+    EVAL_SAMPLES = 100
+    TRAIN_SAMPLES = 1000
+    MAX_LENGTH = 512
+
+    print(f"\nConfiguration:")
+    print(f"  Model: {MODEL_NAME}")
+    print(f"  Compression ratio: {COMPRESSION_RATIO}x")
+    print(f"  Device: {DEVICE}")
+    print(f"  Dtype: {DTYPE}")
+    print(f"  Eval samples: {EVAL_SAMPLES}")
+    print(f"  Train samples: {TRAIN_SAMPLES}")
+
+    # Load dataset
+    print("\n" + "=" * 70)
+    print("Loading WikiText-2 dataset...")
+    print("=" * 70)
+
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+    train_texts = [
+        t for t in dataset["train"]["text"] if t and len(t.strip()) > 50
+    ][:TRAIN_SAMPLES]
+    eval_texts = [
+        t for t in dataset["test"]["text"] if t and len(t.strip()) > 50
+    ][:EVAL_SAMPLES]
+
+    print(f"  Train texts: {len(train_texts)}")
+    print(f"  Eval texts: {len(eval_texts)}")
+
+    # =========================================================================
+    # Step 1: Load original model and measure baseline perplexity
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 1: Loading original Qwen3-8B model...")
+    print("=" * 70)
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    start_time = time.time()
+    original_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=DTYPE,
+        device_map="auto",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    load_time = time.time() - start_time
+    print(f"  Load time: {load_time:.1f}s")
+    print(f"  GPU memory: {get_gpu_memory():.2f} GB")
+
+    # Print attention config including QK norm status
+    hf_config = original_model.config
+    n_heads = hf_config.num_attention_heads
+    n_kv_heads = getattr(hf_config, "num_key_value_heads", n_heads)
+    qk_norm = getattr(hf_config, "qk_norm", False)
+    print(f"\n  Attention Configuration:")
+    print(f"    Query heads (n_heads): {n_heads}")
+    print(f"    KV heads (n_kv_heads): {n_kv_heads}")
+    if n_kv_heads < n_heads:
+        print(f"    Type: GQA ({n_heads // n_kv_heads}x repetition)")
+    else:
+        print(f"    Type: MHA (standard)")
+    print(f"    QK Norm: {qk_norm}")
+
+    # Baseline perplexity
+    print("\nComputing baseline perplexity...")
+    start_time = time.time()
+    baseline_ppl = compute_perplexity(
+        original_model,
+        tokenizer,
+        eval_texts[:50],
+        max_length=MAX_LENGTH,
+        batch_size=1,
+        verbose=True,
+    )
+    ppl_time = time.time() - start_time
+    print(f"  Baseline perplexity: {baseline_ppl:.2f}")
+    print(f"  Evaluation time: {ppl_time:.1f}s")
+
+    # Generate baseline samples
+    print("\nGenerating baseline samples...")
+    prompts = [
+        "The theory of relativity states that",
+        "In machine learning, attention mechanisms",
+        "The capital of France is",
+    ]
+    if tokenizer.pad_token_id == tokenizer.eos_token_id:
+        original_model.generation_config.pad_token_id = tokenizer.eos_token_id
+    baseline_generations = generate_samples(
+        original_model, tokenizer, prompts, max_new_tokens=50, temperature=0.7
+    )
+    print("\nBaseline generations:")
+    for prompt, gen in zip(prompts, baseline_generations):
+        print(f"  Prompt: {prompt}")
+        print(f"  Output: {gen[len(prompt):].strip()[:100]}...")
+        print()
+
+    # =========================================================================
+    # Step 2: Convert to MLA
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 2: Converting to MLA...")
+    print("=" * 70)
+
+    # Clear memory
+    print("Freeing original model memory...")
+    del original_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"GPU memory after cleanup: {get_gpu_memory():.2f} GB")
+
+    import os
+
+    model_short_name = MODEL_NAME.split("/")[-1].lower()
+    MLA_CONVERTED_PATH = (
+        f"./{model_short_name}-xkv-{int(COMPRESSION_RATIO)}x-converted"
+    )
+    MLA_TRAINED_PATH = f"./{model_short_name}-xkv-{int(COMPRESSION_RATIO)}x-trained"
+
+    already_trained = False
+
+    if os.path.exists(MLA_TRAINED_PATH):
+        print(f"Loading existing trained model from {MLA_TRAINED_PATH}...")
+        start_time = time.time()
+        mla_model, tokenizer = load_mla_model(
+            MLA_TRAINED_PATH, device=DEVICE, dtype=DTYPE
+        )
+        conversion_time = time.time() - start_time
+        already_trained = True
+        print(f"  Load time: {conversion_time:.1f}s")
+    elif os.path.exists(MLA_CONVERTED_PATH):
+        print(f"Loading existing converted model from {MLA_CONVERTED_PATH}...")
+        start_time = time.time()
+        mla_model, tokenizer = load_mla_model(
+            MLA_CONVERTED_PATH, device=DEVICE, dtype=DTYPE
+        )
+        conversion_time = time.time() - start_time
+        print(f"  Load time: {conversion_time:.1f}s")
+    else:
+        print("No existing model found, converting...")
+        start_time = time.time()
+        mla_model, tokenizer = convert_to_mla(
+            MODEL_NAME,
+            compression_ratio=COMPRESSION_RATIO,
+            compression_method="auto",
+            cross_layer_group_size=4,
+            xkv_skip_early_layers=0,
+            keep_early_layers_original=False,
+            device=DEVICE,
+            dtype=DTYPE,
+            use_calibration=True,
+            calibration_dataset="wikitext",
+            calibration_dataset_subset="wikitext-2-raw-v1",
+            num_calibration_samples=256,
+            max_calibration_length=512,
+            use_randomized_svd=False,
+            store_original_weights=True,
+            verbose=True,
+        )
+        conversion_time = time.time() - start_time
+        print(f"\n  Conversion time: {conversion_time:.1f}s")
+
+        print(f"\nSaving converted model to {MLA_CONVERTED_PATH}...")
+        save_mla_model(mla_model, tokenizer, MLA_CONVERTED_PATH)
+
+    print(f"  GPU memory after loading: {get_gpu_memory():.2f} GB")
+
+    # Verify QK norms are present after conversion
+    print("\nVerifying QK norm modules...")
+    handler = getattr(mla_model, "mla_handler", None)
+    norms_found = 0
+    for layer_idx in range(mla_model.mla_config.n_layers):
+        if handler is not None:
+            layer = handler.get_layer_module(layer_idx)
+            attn = getattr(layer, handler.get_attention_attribute_name())
+        else:
+            attn = mla_model.model.layers[layer_idx].self_attn
+        mla = getattr(attn, "mla", attn)
+        if getattr(mla, "q_norm", None) is not None:
+            norms_found += 1
+    print(f"  Layers with q_norm: {norms_found}/{mla_model.mla_config.n_layers}")
+    print(f"  QK norm config: {mla_model.mla_config.qk_norm}")
+
+    # =========================================================================
+    # Step 3: Measure KV cache compression
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 3: KV Cache Compression Analysis")
+    print("=" * 70)
+
+    cache_stats = measure_cache_memory(
+        mla_model, sequence_lengths=[128, 512, 1024, 2048, 4096]
+    )
+
+    print(f"\nMLA Configuration:")
+    print(f"  d_latent: {cache_stats['config']['d_latent']}")
+    print(f"  d_kv (original): {cache_stats['config']['d_kv']}")
+    print(f"  n_layers: {cache_stats['config']['n_layers']}")
+    print(
+        f"  Theoretical compression: "
+        f"{cache_stats['config']['theoretical_compression_ratio']:.2f}x"
+    )
+
+    print(f"\nMemory savings by sequence length:")
+    print(
+        f"  {'Seq Len':<10} {'Standard':<12} {'MLA':<12} {'Saved':<12} {'Ratio':<8}"
+    )
+    print(f"  {'-' * 54}")
+    for seq_len, stats in cache_stats["per_sequence_length"].items():
+        print(
+            f"  {seq_len:<10} {stats['standard_cache_formatted']:<12} "
+            f"{stats['mla_cache_formatted']:<12} "
+            f"{stats['memory_saved_formatted']:<12} {stats['compression_ratio']:.2f}x"
+        )
+
+    pre_train_ppl = None
+    train_time = 0
+    trainer = None
+
+    if not already_trained:
+        # =====================================================================
+        # Step 4: Post-conversion perplexity (before training)
+        # =====================================================================
+        print("\n" + "=" * 70)
+        print("Step 4: Post-conversion perplexity (before training)")
+        print("=" * 70)
+
+        start_time = time.time()
+        pre_train_ppl = compute_perplexity(
+            mla_model,
+            tokenizer,
+            eval_texts[:50],
+            max_length=MAX_LENGTH,
+            batch_size=1,
+            verbose=True,
+        )
+        ppl_time = time.time() - start_time
+        print(f"  Pre-training perplexity: {pre_train_ppl:.2f}")
+        print(
+            f"  Perplexity increase: "
+            f"{((pre_train_ppl / baseline_ppl) - 1) * 100:.1f}%"
+        )
+        print(f"  Evaluation time: {ppl_time:.1f}s")
+
+        # =====================================================================
+        # Step 5: Fine-tune with Riemannian optimization + Reconstruction Loss
+        # =====================================================================
+        print("\n" + "=" * 70)
+        print("Step 5: Fine-tuning with Riemannian optimization + Reconstruction Loss")
+        print("=" * 70)
+        print("Note: Using reconstruction loss (no teacher model needed, saves memory)")
+
+        trainer = MLATrainer(
+            model=mla_model,
+            tokenizer=tokenizer,
+            euclidean_lr=1e-5,
+            riemannian_lr=1e-4,
+            use_distillation=False,
+            use_reconstruction_loss=True,
+            reconstruction_alpha=0.3,
+        )
+
+        start_time = time.time()
+        trainer.train(
+            train_texts,
+            num_epochs=3,
+            batch_size=2,
+            max_length=MAX_LENGTH,
+        )
+        train_time = time.time() - start_time
+        print(f"\n  Training time: {train_time:.1f}s")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        print("\n" + "=" * 70)
+        print("Steps 4-5: Skipped (using existing trained model)")
+        print("=" * 70)
+
+    # =========================================================================
+    # Step 6: Post-training perplexity
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 6: Post-training perplexity")
+    print("=" * 70)
+
+    start_time = time.time()
+    post_train_ppl = compute_perplexity(
+        mla_model,
+        tokenizer,
+        eval_texts[:50],
+        max_length=MAX_LENGTH,
+        batch_size=1,
+        verbose=True,
+    )
+    ppl_time = time.time() - start_time
+    print(f"  Post-training perplexity: {post_train_ppl:.2f}")
+    if pre_train_ppl is not None:
+        print(
+            f"  Improvement from pre-train: "
+            f"{((pre_train_ppl / post_train_ppl) - 1) * 100:.1f}%"
+        )
+    print(f"  Evaluation time: {ppl_time:.1f}s")
+
+    # =========================================================================
+    # Step 7: Generation quality
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 7: Generation quality after MLA conversion + training")
+    print("=" * 70)
+
+    if tokenizer.pad_token_id == tokenizer.eos_token_id:
+        mla_model.generation_config.pad_token_id = tokenizer.eos_token_id
+
+    mla_generations = generate_samples(
+        mla_model, tokenizer, prompts, max_new_tokens=50, temperature=0.7
+    )
+
+    print("\nMLA model generations:")
+    for prompt, gen in zip(prompts, mla_generations):
+        print(f"  Prompt: {prompt}")
+        print(f"  Output: {gen[len(prompt):].strip()[:100]}...")
+        print()
+
+    # =========================================================================
+    # Step 8: Orthonormality verification
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 8: Orthonormality verification")
+    print("=" * 70)
+
+    max_uk_error = 0
+    max_uv_error = 0
+
+    handler = getattr(mla_model, "mla_handler", None)
+    for layer_idx in range(mla_model.mla_config.n_layers):
+        if handler is not None:
+            layer = handler.get_layer_module(layer_idx)
+            attn = getattr(layer, handler.get_attention_attribute_name())
+        else:
+            attn = mla_model.model.layers[layer_idx].self_attn
+        if hasattr(attn, "mla"):
+            errors = attn.mla.check_orthonormality()
+            max_uk_error = max(max_uk_error, errors["W_uk"][0])
+            max_uv_error = max(max_uv_error, errors["W_uv"][0])
+
+    print(f"  Max W_uk orthonormality error: {max_uk_error:.2e}")
+    print(f"  Max W_uv orthonormality error: {max_uv_error:.2e}")
+    print(
+        f"  Status: {'PASS' if max(max_uk_error, max_uv_error) < 1e-3 else 'WARNING'}"
+    )
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("BENCHMARK SUMMARY")
+    print("=" * 70)
+
+    use_xkv = getattr(mla_model.mla_config, "use_cross_layer", False)
+    compression_method = mla_model.mla_config.compression_method
+    keep_early_original = getattr(
+        mla_model.mla_config, "keep_early_layers_original", False
+    )
+    skip_layers = getattr(mla_model.mla_config, "xkv_skip_early_layers", 0)
+
+    n_original_layers = skip_layers if keep_early_original else 0
+    n_compressed_layers = mla_model.mla_config.n_layers - n_original_layers
+    original_total = mla_model.mla_config.n_layers * cache_stats["config"]["d_kv"] * 2
+    compressed_total = (
+        n_original_layers * cache_stats["config"]["d_kv"] * 2
+        + n_compressed_layers * cache_stats["config"]["d_latent"] * 2
+    )
+    effective_ratio = original_total / compressed_total
+
+    print(f"\nModel: {MODEL_NAME}")
+    print(f"Handler: GenericHandler (auto-discovered)")
+    print(f"Compression Ratio: {COMPRESSION_RATIO}x (target)")
+    print(
+        f"Compression Method: {compression_method}"
+        f"{' (xKV cross-layer)' if use_xkv else ''}"
+    )
+    print(f"QK Norm: {mla_model.mla_config.qk_norm}")
+    if use_xkv:
+        print(
+            f"xKV Groups: {mla_model.mla_config.n_groups} groups of "
+            f"{mla_model.mla_config.cross_layer_group_size} layers"
+        )
+    if keep_early_original and skip_layers > 0:
+        print(
+            f"Early Layers: {skip_layers} layers kept as original (no compression)"
+        )
+    print(f"\nPERPLEXITY:")
+    print(f"  Baseline (original):     {baseline_ppl:.2f}")
+    if pre_train_ppl is not None:
+        print(
+            f"  After MLA conversion:    {pre_train_ppl:.2f} "
+            f"(+{((pre_train_ppl / baseline_ppl) - 1) * 100:.1f}%)"
+        )
+    print(
+        f"  After fine-tuning:       {post_train_ppl:.2f} "
+        f"(+{((post_train_ppl / baseline_ppl) - 1) * 100:.1f}%)"
+    )
+    print(f"\nKV CACHE COMPRESSION:")
+    print(
+        f"  Original KV dim:         {cache_stats['config']['d_kv'] * 2} "
+        f"(K: {cache_stats['config']['d_kv']}, V: {cache_stats['config']['d_kv']})"
+    )
+    print(
+        f"  Compressed dim:          {cache_stats['config']['d_latent'] * 2} "
+        f"(c_k: {cache_stats['config']['d_latent']}, "
+        f"c_v: {cache_stats['config']['d_latent']})"
+    )
+    print(f"  Per-layer compression:   {cache_stats['compression_ratio']:.2f}x")
+    print(
+        f"  Effective compression:   {effective_ratio:.2f}x "
+        f"(accounting for {n_original_layers} uncompressed layers)"
+    )
+    seq_2048 = cache_stats["per_sequence_length"][2048]
+    print(
+        f"\n  Memory at 2048 tokens:   "
+        f"{seq_2048['standard_cache_formatted']} -> "
+        f"{seq_2048['mla_cache_formatted']}"
+    )
+    print(f"  Memory saved:            {seq_2048['memory_saved_formatted']}")
+    print(f"\nTIMING:")
+    print(f"  Conversion time:         {conversion_time:.1f}s")
+    if train_time > 0:
+        print(f"  Training time:           {train_time:.1f}s")
+    print(f"\nORTHONORMALITY:")
+    print(f"  Max error:               {max(max_uk_error, max_uv_error):.2e}")
+    print(
+        f"  Status:                  "
+        f"{'PRESERVED' if max(max_uk_error, max_uv_error) < 1e-3 else 'DRIFTED'}"
+    )
+    print()
+
+    # =========================================================================
+    # Save trained model
+    # =========================================================================
+    print(f"Saving trained model to {MLA_TRAINED_PATH}...")
+    save_mla_model(mla_model, tokenizer, MLA_TRAINED_PATH)
+    print(f"Model saved to {MLA_TRAINED_PATH}")
+
+    # =========================================================================
+    # Step 9: HuggingFace AutoModel round-trip test
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Step 9: HuggingFace AutoModel round-trip test")
+    print("=" * 70)
+
+    # Free model from memory
+    print("Freeing trained model from memory...")
+    if trainer is not None:
+        trainer.cleanup()
+        del trainer
+    # Clear all local references
+    del handler, attn
+    del mla_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"  GPU memory after cleanup: {get_gpu_memory():.2f} GB")
+
+    # Reload via standard HuggingFace API
+    print(f"\nLoading model via AutoModelForCausalLM.from_pretrained()...")
+    start_time = time.time()
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MLA_TRAINED_PATH,
+        trust_remote_code=True,
+        torch_dtype=DTYPE,
+    )
+    hf_tokenizer = AutoTokenizer.from_pretrained(MLA_TRAINED_PATH)
+    if hf_tokenizer.pad_token is None:
+        hf_tokenizer.pad_token = hf_tokenizer.eos_token
+    hf_load_time = time.time() - start_time
+    print(f"  HF load time: {hf_load_time:.1f}s")
+    print(f"  GPU memory: {get_gpu_memory():.2f} GB")
+
+    # Generate a poem about programming
+    print("\nGenerating a poem about programming...")
+    poem_prompt = "Write a short poem about programming:\n\n"
+    poem_inputs = hf_tokenizer(poem_prompt, return_tensors="pt").to(DEVICE)
+    hf_model.generation_config.pad_token_id = hf_tokenizer.eos_token_id
+    with torch.no_grad():
+        poem_output = hf_model.generate(
+            poem_inputs.input_ids,
+            max_new_tokens=200,
+            temperature=0.7,
+            do_sample=True,
+        )
+    poem_text = hf_tokenizer.decode(poem_output[0], skip_special_tokens=True)
+    print(f"\n{poem_text}")
+
+    print("\nBenchmark complete!")
+
+
+if __name__ == "__main__":
+    main()

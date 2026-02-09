@@ -100,6 +100,7 @@ class CacheShrinkModelForCausalLM(PreTrainedModel):
             device=device,
             dtype=dtype,
             low_cpu_mem_usage=low_cpu_mem_usage,
+            load_training_buffers=False,
         )
 
         return model

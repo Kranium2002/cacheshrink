@@ -21,6 +21,7 @@ def save_mla_model(
     training_stats: Optional[Dict[str, Any]] = None,
     use_safetensors: bool = True,
     enable_hf_loading: bool = True,
+    save_training_buffers: bool = False,
 ) -> None:
     """Save an MLA-converted model.
 
@@ -42,6 +43,9 @@ def save_mla_model(
         training_stats: Optional training statistics to save
         use_safetensors: Whether to use safetensors format (recommended)
         enable_hf_loading: Whether to enable AutoModelForCausalLM.from_pretrained() support
+        save_training_buffers: Whether to save W_k_original/W_v_original training buffers.
+            Default False excludes them, reducing saved model size. Set to True only if
+            you plan to resume training with reconstruction loss later.
     """
     os.makedirs(save_directory, exist_ok=True)
 
@@ -96,6 +100,13 @@ def save_mla_model(
 
     # Save model weights
     state_dict = model.state_dict()
+
+    # Optionally exclude training buffers (W_k_original, W_v_original)
+    if not save_training_buffers:
+        state_dict = {
+            k: v for k, v in state_dict.items()
+            if not k.endswith("W_k_original") and not k.endswith("W_v_original")
+        }
 
     if use_safetensors:
         # Convert any non-tensor values and ensure compatibility
@@ -192,6 +203,7 @@ def load_mla_model(
     device: Optional[Union[str, torch.device]] = None,
     dtype: Optional[torch.dtype] = None,
     low_cpu_mem_usage: bool = True,
+    load_training_buffers: bool = False,
 ) -> Tuple[nn.Module, "AutoTokenizer"]:
     """Load a saved MLA model.
 
@@ -200,6 +212,9 @@ def load_mla_model(
         device: Device to load model to
         dtype: Data type for model
         low_cpu_mem_usage: Use accelerate for faster loading (default True)
+        load_training_buffers: Whether to load W_k_original/W_v_original training
+            buffers. Set to True only if you plan to resume training with
+            reconstruction loss. Default False saves memory at inference.
 
     Returns:
         Tuple of (model, tokenizer)
@@ -304,6 +319,20 @@ def load_mla_model(
                 compression_method=compression_method,
             )
 
+        # Recreate QK norm modules if needed (e.g., Qwen3 with qk_norm=True)
+        # Norms operate on per-head dim (d_head), matching Qwen3's pattern
+        if getattr(mla_config, "qk_norm", False):
+            from .attention import RMSNorm
+
+            eps = mla_config.layer_norm_eps
+            if low_cpu_mem_usage:
+                with torch.device("meta"):
+                    mla_attn.q_norm = RMSNorm(mla_config.d_head, eps=eps)
+                    mla_attn.k_norm = RMSNorm(mla_config.d_head, eps=eps)
+            else:
+                mla_attn.q_norm = RMSNorm(mla_config.d_head, eps=eps)
+                mla_attn.k_norm = RMSNorm(mla_config.d_head, eps=eps)
+
         # For xKV, replace the compression module with one from the group
         # But only for non-early layers (early layers use per-layer MLA)
         if use_xkv and xkv_groups is not None and mla_config.is_xkv_layer(layer_idx):
@@ -324,8 +353,15 @@ def load_mla_model(
 
     # xKV groups are already registered on model as nn.ModuleDict (see earlier)
 
-    # Move state dict to target device (already loaded earlier for bias detection)
+    # Filter out training buffers before loading to GPU to save memory
     target_device = torch.device(device)
+    if not load_training_buffers:
+        state_dict_for_check = {
+            k: v for k, v in state_dict_for_check.items()
+            if not k.endswith("W_k_original") and not k.endswith("W_v_original")
+        }
+
+    # Move state dict to target device
     state_dict = {k: v.to(target_device) for k, v in state_dict_for_check.items()}
     del state_dict_for_check  # Free CPU memory
 
@@ -338,6 +374,13 @@ def load_mla_model(
         xkv_state_dict = load_file(xkv_safetensors_path, device=str(target_device))
     elif os.path.exists(xkv_pytorch_path):
         xkv_state_dict = torch.load(xkv_pytorch_path, map_location=target_device)
+
+    # Filter training buffers from xKV state dict too
+    if not load_training_buffers and xkv_state_dict is not None:
+        xkv_state_dict = {
+            k: v for k, v in xkv_state_dict.items()
+            if not k.endswith("W_k_original") and not k.endswith("W_v_original")
+        }
 
     # Convert dtype if needed, but keep compression params in float32
     # (W_uk, W_uv, W_down_k, W_down_v are Stiefel/compression params that
@@ -494,7 +537,6 @@ def load_mla_model(
 
             # Check if this is a compression module
             if isinstance(child, MLACompression):
-                # Convert all parameters in the compression module to float32
                 if child.W_down_k.weight.dtype != torch.float32:
                     child.W_down_k.weight.data = child.W_down_k.weight.data.float()
                 if child.W_down_v.weight.dtype != torch.float32:
@@ -504,19 +546,16 @@ def load_mla_model(
                 if child.W_uv.dtype != torch.float32:
                     child.W_uv.data = child.W_uv.data.float()
 
-            # Handle XKVCompression modules
             if isinstance(child, XKVCompression):
                 if child.W_down_k.weight.dtype != torch.float32:
                     child.W_down_k.weight.data = child.W_down_k.weight.data.float()
                 if child.W_down_v.weight.dtype != torch.float32:
                     child.W_down_v.weight.data = child.W_down_v.weight.data.float()
-                # W_uk, W_uv are shared references - handled at group level
                 if child.W_uk.dtype != torch.float32:
                     child.W_uk.data = child.W_uk.data.float()
                 if child.W_uv.dtype != torch.float32:
                     child.W_uv.data = child.W_uv.data.float()
 
-            # Also handle improved compression modules
             if hasattr(child, 'W_down') and hasattr(child, 'W_uk') and hasattr(child, 'W_uv'):
                 if child.W_down.weight.dtype != torch.float32:
                     child.W_down.weight.data = child.W_down.weight.data.float()
@@ -525,13 +564,18 @@ def load_mla_model(
                 if child.W_uv.dtype != torch.float32:
                     child.W_uv.data = child.W_uv.data.float()
 
-        # Also handle any remaining ManifoldParameter instances
         for name, param in module.named_parameters(recurse=False):
             if isinstance(param, geoopt.ManifoldParameter):
                 if param.dtype != torch.float32:
                     param.data = param.data.float()
 
     ensure_compression_params_float32(model)
+
+    # Freeze QK norm parameters if present
+    if getattr(mla_config, "qk_norm", False):
+        for name, param in model.named_parameters():
+            if "q_norm" in name or "k_norm" in name:
+                param.requires_grad = False
 
     # Also ensure xKV groups have float32 manifold parameters
     if use_xkv and hasattr(model, 'xkv_groups'):
@@ -562,20 +606,23 @@ def load_mla_model(
                     child.register_buffer('W_k_original', state_dict[w_k_key])
                     child.register_buffer('W_v_original', state_dict[w_v_key])
 
-    restore_original_weight_buffers(model, state_dict)
+    if load_training_buffers:
+        restore_original_weight_buffers(model, state_dict)
 
-    # Also restore original weight buffers in xKV groups from their state dict
+    # Restore xKV group buffers (biases always, original weights only if requested)
     if use_xkv and hasattr(model, 'xkv_groups') and xkv_state_dict is not None:
         for group_idx_str, group in model.xkv_groups.items():
             group_idx = int(group_idx_str)
             for layer_idx_str, comp in group.layer_compressions.items():
                 prefix = f"xkv_group_{group_idx}.layer_compressions.{layer_idx_str}."
-                w_k_key = f"{prefix}W_k_original"
-                w_v_key = f"{prefix}W_v_original"
 
-                if w_k_key in xkv_state_dict and w_v_key in xkv_state_dict:
-                    comp.register_buffer('W_k_original', xkv_state_dict[w_k_key].to(target_device))
-                    comp.register_buffer('W_v_original', xkv_state_dict[w_v_key].to(target_device))
+                if load_training_buffers:
+                    w_k_key = f"{prefix}W_k_original"
+                    w_v_key = f"{prefix}W_v_original"
+
+                    if w_k_key in xkv_state_dict and w_v_key in xkv_state_dict:
+                        comp.register_buffer('W_k_original', xkv_state_dict[w_k_key].to(target_device))
+                        comp.register_buffer('W_v_original', xkv_state_dict[w_v_key].to(target_device))
 
                 # CRITICAL: Restore b_k and b_v buffers (K/V biases)
                 # These are essential for models like Qwen that have biases on k_proj/v_proj
@@ -620,20 +667,6 @@ def load_mla_model(
                     print(f"Warning: Layer {layer_idx_str} W_uv is not shared with group {group_idx_str}")
                     # Re-establish the reference
                     comp.W_uv = group.shared_W_uv
-
-    # Final dtype enforcement: ensure all non-compression params are in target dtype.
-    # The to_empty() + to(dtype) + load_state_dict flow can leave some parameters
-    # in the wrong dtype when shared module references (xKV) are involved.
-    # Compression params (W_uk, W_uv, W_down_k, W_down_v) intentionally stay float32
-    # since the compression module casts inputs to float32 internally.
-    if dtype is not None:
-        _compression_markers = ("W_uk", "W_uv", "shared_W_uk", "shared_W_uv",
-                                "W_down_k.", "W_down_v.", "W_down.")
-        for name, param in model.named_parameters():
-            if param.is_floating_point() and param.dtype != dtype:
-                if any(marker in name for marker in _compression_markers):
-                    continue
-                param.data = param.data.to(dtype)
 
     # Attach config
     model.mla_config = mla_config

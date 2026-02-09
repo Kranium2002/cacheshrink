@@ -103,6 +103,17 @@ class ModelHandler(ABC):
         """
         pass
 
+    def extract_qk_norms(self, layer_idx: int):
+        """Extract QK norm modules from an attention layer.
+
+        Args:
+            layer_idx: Layer index
+
+        Returns:
+            Tuple of (q_norm, k_norm), each may be None if not present
+        """
+        return None, None
+
     def get_num_layers(self) -> int:
         """Get number of transformer layers."""
         return self.config.n_layers
