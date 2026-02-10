@@ -22,8 +22,9 @@ class TestRotaryEmbedding:
         assert rope.dim == 64
         assert rope.max_position_embeddings == 2048
         assert rope.inv_freq.shape == (32,)  # dim // 2
-        assert rope.cos_cached.shape == (2048, 64)
-        assert rope.sin_cached.shape == (2048, 64)
+        # Cache is built on demand, not at init
+        assert rope.cos_cached is None
+        assert rope.max_seq_len_cached == 0
 
     def test_forward_without_position_ids(self, device, dtype):
         """Test RoPE forward without explicit position IDs."""
@@ -47,11 +48,18 @@ class TestRotaryEmbedding:
         assert sin.shape == (2, 16, 64)
 
     def test_cache_extension(self, device, dtype):
-        """Test that cache extends for longer sequences."""
+        """Test that cache builds and extends for longer sequences."""
         rope = RotaryEmbedding(dim=64, max_position_embeddings=128).to(device)
 
-        assert rope.max_seq_len_cached == 128
+        # Cache starts empty (built on demand)
+        assert rope.max_seq_len_cached == 0
 
+        # First forward builds cache
+        x = torch.randn(1, 1, 64, 64, device=device, dtype=dtype)
+        cos, sin = rope(x, seq_len=64)
+        assert rope.max_seq_len_cached == 64
+
+        # Extend cache for longer sequence
         x = torch.randn(1, 1, 256, 64, device=device, dtype=dtype)
         cos, sin = rope(x, seq_len=256)
 

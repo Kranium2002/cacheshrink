@@ -106,8 +106,8 @@ class XKVCompression(nn.Module):
             First d_latent dims are c_k, last d_latent dims are c_v
         """
         h_float = h.float()
-        c_k = self.W_down_k(h_float)  # (batch, seq, d_latent)
-        c_v = self.W_down_v(h_float)
+        c_k = torch.nn.functional.linear(h_float, self.W_down_k.weight.float(), None)
+        c_v = torch.nn.functional.linear(h_float, self.W_down_v.weight.float(), None)
         return torch.cat([c_k, c_v], dim=-1).to(h.dtype)
 
     def decompress_k(self, c: torch.Tensor) -> torch.Tensor:
@@ -120,7 +120,7 @@ class XKVCompression(nn.Module):
             Keys of shape (batch, seq_len, d_kv)
         """
         c_k = c[..., : self.d_latent].float()
-        k = torch.matmul(c_k, self.W_uk.T)
+        k = torch.matmul(c_k, self.W_uk.float().T)
         # Add K bias if present (critical for models like Qwen)
         if self.b_k is not None:
             k = k + self.b_k.to(k.device).float()
@@ -136,7 +136,7 @@ class XKVCompression(nn.Module):
             Values of shape (batch, seq_len, d_kv)
         """
         c_v = c[..., self.d_latent :].float()
-        v = torch.matmul(c_v, self.W_uv.T)
+        v = torch.matmul(c_v, self.W_uv.float().T)
         # Add V bias if present (critical for models like Qwen)
         if self.b_v is not None:
             v = v + self.b_v.to(v.device).float()
@@ -219,10 +219,12 @@ class XKVCompression(nn.Module):
             W_uk: K decompression weights of shape (d_kv, d_latent)
             W_uv: V decompression weights of shape (d_kv, d_latent)
         """
-        self.W_down_k.weight.data = W_down_k.to(self.W_down_k.weight.device).float()
-        self.W_down_v.weight.data = W_down_v.to(self.W_down_v.weight.device).float()
-        self.W_uk.data = orthonormalize_columns(W_uk.to(self.W_uk.device).float())
-        self.W_uv.data = orthonormalize_columns(W_uv.to(self.W_uv.device).float())
+        target_dtype = self.W_down_k.weight.dtype
+        self.W_down_k.weight.data = W_down_k.to(device=self.W_down_k.weight.device, dtype=target_dtype)
+        self.W_down_v.weight.data = W_down_v.to(device=self.W_down_v.weight.device, dtype=target_dtype)
+        # Orthonormalize in float32 for numerical precision, then store in param's dtype
+        self.W_uk.data = orthonormalize_columns(W_uk.to(self.W_uk.device).float()).to(self.W_uk.dtype)
+        self.W_uv.data = orthonormalize_columns(W_uv.to(self.W_uv.device).float()).to(self.W_uv.dtype)
 
     def store_original_weights(self, W_k: torch.Tensor, W_v: torch.Tensor) -> None:
         """Store original K/V projection weights for reconstruction loss.
@@ -375,8 +377,9 @@ class XKVCompressionGroup(nn.Module):
             W_uk: Shared K decompression matrix of shape (d_kv, d_latent)
             W_uv: Shared V decompression matrix of shape (d_kv, d_latent)
         """
-        self.shared_W_uk.data = orthonormalize_columns(W_uk.clone().float())
-        self.shared_W_uv.data = orthonormalize_columns(W_uv.clone().float())
+        # Orthonormalize in float32 for precision, then store in param's dtype
+        self.shared_W_uk.data = orthonormalize_columns(W_uk.clone().float()).to(self.shared_W_uk.dtype)
+        self.shared_W_uv.data = orthonormalize_columns(W_uv.clone().float()).to(self.shared_W_uv.dtype)
 
     def check_orthonormality(self) -> Dict[str, Tuple[float, float]]:
         """Check orthonormality of shared decompression matrices.

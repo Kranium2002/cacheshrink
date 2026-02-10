@@ -180,6 +180,12 @@ class GenericHandler(ModelHandler):
 
         return None
 
+    def extract_qk_norms(self, layer_idx: int):
+        attn = self.get_attention_module(layer_idx)
+        q_norm = getattr(attn, "q_norm", None)
+        k_norm = getattr(attn, "k_norm", None)
+        return q_norm, k_norm
+
     def get_attention_module(self, layer_idx: int) -> nn.Module:
         return getattr(self._layer_list[layer_idx], self._attn_attr)
 
@@ -347,12 +353,21 @@ class GenericAttentionAdapter(nn.Module):
         self._cache_d_latent = config.computed_d_latent
 
     def _c_kv_to_cache_format(self, c_kv: torch.Tensor):
-        keys = c_kv.unsqueeze(1)
-        values = torch.zeros_like(keys)
-        return keys, values
+        """Split c_kv into two halves and store as (key, value) in DynamicCache.
 
-    def _cache_to_c_kv(self, keys: torch.Tensor) -> torch.Tensor:
-        return keys.squeeze(1)
+        c_kv has shape (batch, seq, 2*d_latent) — first half is c_k, second is c_v.
+        We add a head dim to get (batch, 1, seq, d_latent) for each.
+        """
+        c_k, c_v = c_kv.chunk(2, dim=-1)
+        return c_k.unsqueeze(1), c_v.unsqueeze(1)
+
+    def _cache_to_c_kv(self, keys: torch.Tensor, values: torch.Tensor = None) -> torch.Tensor:
+        """Reconstruct c_kv from DynamicCache key/value tensors."""
+        c_k = keys.squeeze(1)
+        if values is not None:
+            c_v = values.squeeze(1)
+            return torch.cat([c_k, c_v], dim=-1)
+        return c_k
 
     def forward(
         self,
@@ -366,21 +381,27 @@ class GenericAttentionAdapter(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
-        """Forward pass compatible with most HF model signatures."""
+        """Forward pass compatible with transformers 5.x HF model signatures.
+
+        Returns (attn_output, attn_weights) matching the signature expected by
+        decoder layers in transformers 5.x. The DynamicCache is updated in-place
+        via cache.update(), not returned in the output tuple.
+        """
         layer_idx = self.mla.layer_idx
 
         # Handle different cache formats
         mla_past = None
+        cache_obj = None  # DynamicCache reference for in-place update
+
         if past_key_values is not None:
-            if hasattr(past_key_values, 'layers') and layer_idx < len(past_key_values.layers):
-                layer = past_key_values.layers[layer_idx]
-                if hasattr(layer, 'keys') and layer.keys is not None and layer.keys.numel() > 0:
-                    c_kv = self._cache_to_c_kv(layer.keys)
-                    mla_past = (c_kv,)
-            elif hasattr(past_key_values, 'key_cache'):
-                if layer_idx < len(past_key_values.key_cache) and past_key_values.key_cache[layer_idx] is not None:
-                    c_kv = self._cache_to_c_kv(past_key_values.key_cache[layer_idx])
-                    mla_past = (c_kv,)
+            if hasattr(past_key_values, 'update'):
+                # DynamicCache path (transformers 5.x)
+                cache_obj = past_key_values
+                if hasattr(past_key_values, 'layers') and layer_idx < len(past_key_values.layers):
+                    layer = past_key_values.layers[layer_idx]
+                    if hasattr(layer, 'keys') and layer.keys is not None and layer.keys.numel() > 0:
+                        c_kv = self._cache_to_c_kv(layer.keys, layer.values)
+                        mla_past = (c_kv,)
             elif isinstance(past_key_values, tuple) and len(past_key_values) >= 1:
                 expected_cache_dim = 2 * self._cache_d_latent
                 if past_key_values[0].shape[-1] == expected_cache_dim:
@@ -393,29 +414,20 @@ class GenericAttentionAdapter(nn.Module):
             past_key_value=mla_past,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            position_embeddings=position_embeddings,
         )
 
-        present_key_values = None
-        if use_cache and new_past is not None:
+        # Store c_kv back into DynamicCache in-place
+        if new_past is not None and cache_obj is not None:
             c_kv_full = new_past[0]
+            # Only store the NEW tokens (DynamicCache accumulates)
+            past_seq_len = mla_past[0].shape[1] if mla_past is not None else 0
+            c_kv_new = c_kv_full[:, past_seq_len:, :]
+            keys, values = self._c_kv_to_cache_format(c_kv_new)
+            cache_obj.update(keys, values, layer_idx=layer_idx)
 
-            if past_key_values is not None and hasattr(past_key_values, 'update'):
-                if mla_past is not None:
-                    past_seq_len = mla_past[0].shape[1]
-                else:
-                    past_seq_len = 0
-
-                c_kv_new = c_kv_full[:, past_seq_len:, :]
-                keys, values = self._c_kv_to_cache_format(c_kv_new)
-                past_key_values.update(keys, values, layer_idx=layer_idx)
-                present_key_values = past_key_values
-            else:
-                present_key_values = new_past
-
-        if output_attentions:
-            return (attn_output, attn_weights, present_key_values)
-        else:
-            return (attn_output, present_key_values)
+        # Return (attn_output, attn_weights) — transformers 5.x signature
+        return attn_output, attn_weights
 
     def check_orthonormality(self):
         return self.mla.check_orthonormality()

@@ -12,6 +12,25 @@ from .compression import MLACompression
 from .utils import repeat_kv
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    Used by models like Qwen3 for QK normalization (qk_norm=True).
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.float()
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x = x / rms
+        return (self.weight.float() * x).to(input_dtype)
+
+
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding (RoPE) implementation.
 
@@ -51,8 +70,10 @@ class RotaryEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Build cos/sin cache
-        self._set_cos_sin_cache(max_position_embeddings, device)
+        # Start with no cache; build on demand in forward() to save memory
+        self.max_seq_len_cached = 0
+        self.register_buffer("cos_cached", None, persistent=False)
+        self.register_buffer("sin_cached", None, persistent=False)
 
     def _set_cos_sin_cache(
         self,
@@ -93,8 +114,8 @@ class RotaryEmbedding(nn.Module):
         if seq_len is None:
             seq_len = x.shape[2] if x.dim() == 4 else x.shape[1]
 
-        # Extend cache if needed
-        if seq_len > self.max_seq_len_cached:
+        # Build or extend cache if needed
+        if self.cos_cached is None or seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len, device=x.device)
 
         if position_ids is not None:
@@ -227,19 +248,29 @@ class MLAAttention(nn.Module):
             bias=config.use_bias,
         )
 
-        # RoPE (for models that use it)
-        uses_rope = config.extra_config.get("uses_rope", config.model_type != "gpt2")
-        if uses_rope:
-            self.rotary_emb = RotaryEmbedding(
-                dim=config.d_head,
-                max_position_embeddings=config.max_position_embeddings,
-                base=config.rope_theta,
-            )
-        else:
-            self.rotary_emb = None
+        # RoPE (lazy creation — only instantiated if position_embeddings not provided)
+        self._uses_rope = config.extra_config.get("uses_rope", config.model_type != "gpt2")
+        self._rope_config = {
+            "dim": config.d_head,
+            "max_position_embeddings": config.max_position_embeddings,
+            "base": config.rope_theta,
+        }
+        self.rotary_emb = None
+        self._owns_rotary_emb = False
 
         # Attention scaling
         self.scale = 1.0 / math.sqrt(self.d_head)
+
+        # QK normalization (used by models like Qwen3 with qk_norm=True)
+        self.q_norm = None
+        self.k_norm = None
+
+    def _get_or_create_rotary_emb(self, device=None):
+        """Lazily create RotaryEmbedding on first use."""
+        if self.rotary_emb is None and self._uses_rope:
+            self.rotary_emb = RotaryEmbedding(**self._rope_config, device=device)
+            self._owns_rotary_emb = True
+        return self.rotary_emb
 
     def forward(
         self,
@@ -249,6 +280,7 @@ class MLAAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, ...]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor]], Optional[torch.Tensor]]:
         """Forward pass.
@@ -273,7 +305,10 @@ class MLAAttention(nn.Module):
         query_states = self.q_proj(hidden_states)
         query_states = query_states.view(
             batch_size, seq_len, self.n_heads, self.d_head
-        ).transpose(1, 2)
+        )
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+        query_states = query_states.transpose(1, 2)
 
         # Compress to latent space
         c_kv = self.mla_compression.compress(hidden_states)
@@ -299,53 +334,100 @@ class MLAAttention(nn.Module):
         kv_seq_len = c_kv.shape[1]
         key_states = key_states.view(
             batch_size, kv_seq_len, self.n_kv_heads, self.d_head
-        ).transpose(1, 2)
+        )
+        # Apply K norm if present (e.g., Qwen3 with qk_norm=True on per-head dim)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
+        key_states = key_states.transpose(1, 2)
         value_states = value_states.view(
             batch_size, kv_seq_len, self.n_kv_heads, self.d_head
         ).transpose(1, 2)
 
         # Apply RoPE if applicable
-        if self.rotary_emb is not None:
-            # Determine the maximum position we need
-            past_len = kv_seq_len - seq_len
+        if self._uses_rope:
+            if position_embeddings is not None:
+                # Use shared position embeddings from the model (avoids per-layer RoPE)
+                cos, sin = position_embeddings
+                # cos/sin are typically (batch, seq_len, head_dim)
+                # We need to handle Q (current positions) and K (all positions including cache)
+                past_len = kv_seq_len - seq_len
 
-            if position_ids is None:
-                # Create position IDs for the current tokens
-                position_ids = torch.arange(
-                    past_len, past_len + seq_len, device=hidden_states.device
-                ).unsqueeze(0).expand(batch_size, -1)
+                if cos.dim() == 3:
+                    # (batch, seq_len, head_dim) — these are for the current tokens only
+                    q_cos = cos.unsqueeze(1)  # (batch, 1, seq_len, head_dim)
+                    q_sin = sin.unsqueeze(1)
+                elif cos.dim() == 2:
+                    q_cos = cos.unsqueeze(0).unsqueeze(0)
+                    q_sin = sin.unsqueeze(0).unsqueeze(0)
+                else:
+                    q_cos = cos
+                    q_sin = sin
 
-            # Get the maximum position we need to handle
-            max_pos = max(kv_seq_len, int(position_ids.max().item()) + 1)
+                query_states = (query_states * q_cos) + (rotate_half(query_states) * q_sin)
 
-            # Get cos/sin for all positions needed
-            cos, sin = self.rotary_emb(value_states, seq_len=max_pos)
+                # For keys, we need RoPE for all positions in the cache
+                # The provided embeddings only cover current positions, so use our own
+                # rotary_emb for the full key range if there's a cache
+                if past_len > 0:
+                    rotary = self._get_or_create_rotary_emb(device=hidden_states.device)
+                    full_cos, full_sin = rotary(key_states, seq_len=kv_seq_len)
+                    k_positions = torch.arange(kv_seq_len, device=hidden_states.device)
+                    if full_cos.dim() == 2:
+                        k_cos = full_cos[k_positions].unsqueeze(0).unsqueeze(0)
+                        k_sin = full_sin[k_positions].unsqueeze(0).unsqueeze(0)
+                    else:
+                        k_cos = full_cos
+                        k_sin = full_sin
+                else:
+                    # No cache — same positions as query
+                    k_cos = q_cos
+                    k_sin = q_sin
 
-            # For query, we only need current positions
-            # For key, we need all positions in the cache
-            if cos.dim() == 2:
-                # cos/sin are (max_pos, head_dim)
-                # Clamp position_ids to valid range
-                safe_position_ids = position_ids.clamp(0, cos.size(0) - 1)
-                q_cos = cos[safe_position_ids]  # (batch, seq_len, head_dim)
-                q_sin = sin[safe_position_ids]
-                # For keys, need all positions
-                k_positions = torch.arange(kv_seq_len, device=hidden_states.device)
-                k_cos = cos[k_positions]  # (kv_seq_len, head_dim)
-                k_sin = sin[k_positions]
+                key_states = (key_states * k_cos) + (rotate_half(key_states) * k_sin)
             else:
-                q_cos, q_sin = cos, sin
-                k_cos, k_sin = cos, sin
+                # Fallback: create/use own RotaryEmbedding
+                rotary = self._get_or_create_rotary_emb(device=hidden_states.device)
+                if rotary is not None:
+                    # Determine the maximum position we need
+                    past_len = kv_seq_len - seq_len
 
-            # Apply RoPE to Q (only current positions)
-            query_states = (query_states * q_cos.unsqueeze(1)) + (
-                rotate_half(query_states) * q_sin.unsqueeze(1)
-            )
-            # Apply RoPE to K (all positions)
-            if k_cos.dim() == 2:
-                k_cos = k_cos.unsqueeze(0).unsqueeze(0)
-                k_sin = k_sin.unsqueeze(0).unsqueeze(0)
-            key_states = (key_states * k_cos) + (rotate_half(key_states) * k_sin)
+                    if position_ids is None:
+                        # Create position IDs for the current tokens
+                        position_ids = torch.arange(
+                            past_len, past_len + seq_len, device=hidden_states.device
+                        ).unsqueeze(0).expand(batch_size, -1)
+
+                    # Get the maximum position we need to handle
+                    max_pos = max(kv_seq_len, int(position_ids.max().item()) + 1)
+
+                    # Get cos/sin for all positions needed
+                    cos, sin = rotary(value_states, seq_len=max_pos)
+
+                    # For query, we only need current positions
+                    # For key, we need all positions in the cache
+                    if cos.dim() == 2:
+                        # cos/sin are (max_pos, head_dim)
+                        # Clamp position_ids to valid range
+                        safe_position_ids = position_ids.clamp(0, cos.size(0) - 1)
+                        q_cos = cos[safe_position_ids]  # (batch, seq_len, head_dim)
+                        q_sin = sin[safe_position_ids]
+                        # For keys, need all positions
+                        k_positions = torch.arange(kv_seq_len, device=hidden_states.device)
+                        k_cos = cos[k_positions]  # (kv_seq_len, head_dim)
+                        k_sin = sin[k_positions]
+                    else:
+                        q_cos, q_sin = cos, sin
+                        k_cos, k_sin = cos, sin
+
+                    # Apply RoPE to Q (only current positions)
+                    query_states = (query_states * q_cos.unsqueeze(1)) + (
+                        rotate_half(query_states) * q_sin.unsqueeze(1)
+                    )
+                    # Apply RoPE to K (all positions)
+                    if k_cos.dim() == 2:
+                        k_cos = k_cos.unsqueeze(0).unsqueeze(0)
+                        k_sin = k_sin.unsqueeze(0).unsqueeze(0)
+                    key_states = (key_states * k_cos) + (rotate_half(key_states) * k_sin)
 
         # Repeat KV heads for GQA
         key_states = repeat_kv(key_states, self.n_rep)

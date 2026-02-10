@@ -116,10 +116,10 @@ class MLACompression(nn.Module):
             Latent representation of shape (batch, seq_len, 2*d_latent)
             First d_latent dims are c_k, last d_latent dims are c_v
         """
-        # Always use float32 for numerical stability
+        # Use float32 for numerical stability during matmul
         h_f32 = h.float()
-        c_k = self.W_down_k(h_f32)
-        c_v = self.W_down_v(h_f32)
+        c_k = torch.nn.functional.linear(h_f32, self.W_down_k.weight.float(), None)
+        c_v = torch.nn.functional.linear(h_f32, self.W_down_v.weight.float(), None)
         result = torch.cat([c_k, c_v], dim=-1)
         return result.to(h.dtype)
 
@@ -133,7 +133,7 @@ class MLACompression(nn.Module):
             Keys of shape (batch, seq_len, d_kv)
         """
         c_k = c_kv[..., :self.d_latent].float()
-        result = torch.matmul(c_k, self.W_uk.T)
+        result = torch.matmul(c_k, self.W_uk.float().T)
         # Add K bias if present (critical for models like Qwen)
         if self.b_k is not None:
             result = result + self.b_k.to(result.device).float()
@@ -149,7 +149,7 @@ class MLACompression(nn.Module):
             Values of shape (batch, seq_len, d_kv)
         """
         c_v = c_kv[..., self.d_latent:].float()
-        result = torch.matmul(c_v, self.W_uv.T)
+        result = torch.matmul(c_v, self.W_uv.float().T)
         # Add V bias if present (critical for models like Qwen)
         if self.b_v is not None:
             result = result + self.b_v.to(result.device).float()
@@ -230,10 +230,11 @@ class MLACompression(nn.Module):
             W_uk: K decompression weights of shape (d_kv, d_latent) - orthonormal columns
             W_uv: V decompression weights of shape (d_kv, d_latent) - orthonormal columns
         """
-        self.W_down_k.weight.data = W_down_k.to(self.W_down_k.weight.device).float()
-        self.W_down_v.weight.data = W_down_v.to(self.W_down_v.weight.device).float()
-        self.W_uk.data = W_uk.to(self.W_uk.device).float()
-        self.W_uv.data = W_uv.to(self.W_uv.device).float()
+        target_dtype = self.W_down_k.weight.dtype
+        self.W_down_k.weight.data = W_down_k.to(device=self.W_down_k.weight.device, dtype=target_dtype)
+        self.W_down_v.weight.data = W_down_v.to(device=self.W_down_v.weight.device, dtype=target_dtype)
+        self.W_uk.data = W_uk.to(device=self.W_uk.device, dtype=self.W_uk.dtype)
+        self.W_uv.data = W_uv.to(device=self.W_uv.device, dtype=self.W_uv.dtype)
 
     def get_euclidean_params(self):
         """Get Euclidean (non-manifold) parameters for standard optimizer."""

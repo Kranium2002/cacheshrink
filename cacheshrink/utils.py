@@ -1,7 +1,57 @@
 """Utility functions for MLA operations."""
 
+import logging
 import torch
 from typing import Tuple, Optional
+
+logger = logging.getLogger(__name__)
+
+
+def robust_svd(
+    M: torch.Tensor, full_matrices: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute SVD with fallbacks for ill-conditioned matrices.
+
+    Tries standard SVD first, then retries with jitter, then falls back
+    to randomized SVD (torch.svd_lowrank) if both fail.
+
+    Args:
+        M: Input matrix of shape (m, n)
+        full_matrices: Whether to compute full U/Vh matrices
+
+    Returns:
+        Tuple of (U, S, Vh) matching torch.linalg.svd output convention
+    """
+    # Attempt 1: standard SVD
+    try:
+        return torch.linalg.svd(M, full_matrices=full_matrices)
+    except torch.linalg.LinAlgError:
+        logger.warning("Standard SVD failed, retrying with jitter regularization")
+
+    # Attempt 2: add small jitter and retry
+    try:
+        jitter = 1e-6 * torch.randn_like(M)
+        return torch.linalg.svd(M + jitter, full_matrices=full_matrices)
+    except torch.linalg.LinAlgError:
+        logger.warning("Jittered SVD failed, retrying with gesvd driver")
+
+    # Attempt 3: use gesvd driver (more robust but slower)
+    try:
+        return torch.linalg.svd(M, full_matrices=full_matrices, driver="gesvd")
+    except (torch.linalg.LinAlgError, RuntimeError):
+        logger.warning("gesvd driver failed, falling back to randomized SVD")
+
+    # Attempt 4: randomized SVD via torch.svd_lowrank
+    # Cap rank to avoid expensive full-rank decomposition on large matrices
+    k = min(M.shape)
+    q = min(k, 512)
+    if q < k:
+        logger.info(f"Randomized SVD fallback using truncated rank {q} instead of full rank {k}")
+    U, S, V = torch.svd_lowrank(M, q=q)
+    # torch.svd_lowrank returns (U, S, V) where V is already transposed
+    # compared to torch.linalg.svd which returns Vh
+    Vh = V.T
+    return U, S, Vh
 
 
 def orthonormalize_rows(W: torch.Tensor, method: str = "polar") -> torch.Tensor:
@@ -30,11 +80,13 @@ def orthonormalize_rows(W: torch.Tensor, method: str = "polar") -> torch.Tensor:
     else:
         # Polar decomposition: find closest orthonormal matrix
         # For W = U @ S @ Vh, the closest orthonormal matrix is U @ Vh
-        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        U, S, Vh = robust_svd(W, full_matrices=False)
         return U @ Vh
 
 
-def orthonormalize_columns(W: torch.Tensor, method: str = "polar") -> torch.Tensor:
+def orthonormalize_columns(
+    W: torch.Tensor, method: str = "polar", sv_clamp_min: float = 1e-7
+) -> torch.Tensor:
     """Orthonormalize the columns of a matrix.
 
     Given a matrix W of shape (m, n) where n <= m, this produces a matrix
@@ -45,6 +97,9 @@ def orthonormalize_columns(W: torch.Tensor, method: str = "polar") -> torch.Tens
         method: "qr" for QR decomposition, "polar" for polar decomposition.
                 "polar" finds the CLOSEST orthonormal matrix (Procrustes solution)
                 which is better for preserving the original matrix's direction.
+        sv_clamp_min: Minimum singular value threshold. Singular values below
+            this are clamped to prevent numerical instability in ill-conditioned
+            matrices.
 
     Returns:
         Matrix with orthonormal columns of same shape as W
@@ -59,7 +114,16 @@ def orthonormalize_columns(W: torch.Tensor, method: str = "polar") -> torch.Tens
     else:
         # Polar decomposition: find closest orthonormal matrix
         # For W = U @ S @ Vh, the closest orthonormal matrix is U @ Vh
-        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        U, S, Vh = robust_svd(W, full_matrices=False)
+        # Clamp near-zero singular values to avoid numerical issues
+        # Skip check on meta tensors (used during model skeleton creation)
+        if sv_clamp_min > 0 and not W.is_meta:
+            if S.min() < sv_clamp_min:
+                n_small = (S < sv_clamp_min).sum().item()
+                logger.warning(
+                    f"Found {n_small} singular value(s) below {sv_clamp_min} "
+                    f"(min was {S.min().item():.2e}); matrix may be ill-conditioned"
+                )
         return U @ Vh
 
 

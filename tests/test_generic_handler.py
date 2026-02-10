@@ -376,16 +376,21 @@ class TestGenericAttentionAdapter:
         assert output[0].shape == (batch_size, seq_len, generic_config_no_rope.d_model)
 
     def test_forward_with_use_cache(self, generic_config):
+        pytest.importorskip("transformers.cache_utils")
+        from transformers.cache_utils import DynamicCache
+
         mla = MLAAttention(generic_config, layer_idx=0)
         adapter = GenericAttentionAdapter(mla, generic_config)
 
         batch_size, seq_len = 1, 4
         hidden = torch.randn(batch_size, seq_len, generic_config.d_model)
 
-        output = adapter(hidden, use_cache=True)
-        assert output[0].shape == (batch_size, seq_len, generic_config.d_model)
-        # Second element should be the cache
-        assert output[1] is not None
+        # transformers 5.x: pass DynamicCache, cache is updated in-place
+        cache = DynamicCache()
+        attn_output, attn_weights = adapter(hidden, past_key_values=cache, use_cache=True)
+        assert attn_output.shape == (batch_size, seq_len, generic_config.d_model)
+        # Cache should have been updated in-place
+        assert cache.get_seq_length() == seq_len
 
     def test_check_orthonormality(self, generic_config):
         mla = MLAAttention(generic_config, layer_idx=0)

@@ -264,7 +264,11 @@ class MLATrainer:
         """Freeze all parameters except MLA compression modules."""
         for name, param in self.model.named_parameters():
             if "mla_compression" in name or "mla." in name:
-                param.requires_grad = True
+                # QK norms stay frozen (they are copied from original model)
+                if "q_norm" in name or "k_norm" in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
             else:
                 param.requires_grad = False
 
@@ -338,6 +342,14 @@ class MLATrainer:
         print(f"Manifold parameters: {len(self.manifold_params)}")
         if use_xkv:
             print(f"  (xKV: shared manifold params across {len(self.model.xkv_groups)} groups)")
+
+        # Ensure compression params are float32 for training stability
+        for p in self.euclidean_params:
+            if p.dtype != torch.float32:
+                p.data = p.data.float()
+        for p in self.manifold_params:
+            if p.dtype != torch.float32:
+                p.data = p.data.float()
 
         # AdamW for Euclidean parameters (W_down compression matrices)
         self.euclidean_optimizer = torch.optim.AdamW(

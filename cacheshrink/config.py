@@ -43,6 +43,7 @@ class MLAConfig:
     vocab_size: int = 50257
     use_bias: bool = True
     layer_norm_eps: float = 1e-5
+    qk_norm: bool = False
 
     # Additional model-specific attributes
     extra_config: Dict[str, Any] = field(default_factory=dict)
@@ -336,6 +337,8 @@ class MLAConfig:
             config["rope_scaling"] = getattr(hf_config, "rope_scaling", None)
 
             config["extra_config"] = {"uses_rope": has_rope}
+
+            config["qk_norm"] = getattr(hf_config, "qk_norm", False)
 
         else:
             raise ValueError(f"Unsupported model type: {model_type}")

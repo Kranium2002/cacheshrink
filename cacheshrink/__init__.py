@@ -22,7 +22,7 @@ Example usage:
     model, tokenizer = load_mla_model("my-mla-model")
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # Core conversion function
 from .converter import convert_to_mla

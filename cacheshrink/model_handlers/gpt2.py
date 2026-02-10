@@ -105,6 +105,12 @@ class GPT2AttentionAdapter(nn.Module):
 
     GPT-2's attention forward has a different signature than LLaMA-style models.
     This adapter wraps MLAAttention to match GPT-2's expectations.
+
+    In transformers >=5.x, GPT-2 passes a DynamicCache object and expects the
+    attention module to call cache.update() internally. The return signature is
+    (attn_output, attn_weights). We store the compressed c_kv latent inside
+    DynamicCache by splitting c_kv into (c_k, c_v) along the last dimension and
+    storing them as separate key and value tensors of shape (batch, 1, seq, d_latent).
     """
 
     def __init__(self, mla_attention: nn.Module):
@@ -115,6 +121,26 @@ class GPT2AttentionAdapter(nn.Module):
         self.num_heads = mla_attention.n_heads
         self.head_dim = mla_attention.d_head
         self.split_size = mla_attention.d_model
+        self.layer_idx = mla_attention.layer_idx
+
+        self._cache_d_latent = mla_attention.config.computed_d_latent
+
+    def _c_kv_to_cache_format(self, c_kv: torch.Tensor):
+        """Split c_kv into two halves and store as (key, value) in DynamicCache.
+
+        c_kv has shape (batch, seq, 2*d_latent) — first half is c_k, second is c_v.
+        We add a head dim to get (batch, 1, seq, d_latent) for each.
+        """
+        c_k, c_v = c_kv.chunk(2, dim=-1)
+        return c_k.unsqueeze(1), c_v.unsqueeze(1)
+
+    def _cache_to_c_kv(self, keys: torch.Tensor, values: torch.Tensor = None) -> torch.Tensor:
+        """Reconstruct c_kv from DynamicCache key/value tensors."""
+        c_k = keys.squeeze(1)
+        if values is not None:
+            c_v = values.squeeze(1)
+            return torch.cat([c_k, c_v], dim=-1)
+        return c_k
 
     def forward(
         self,
@@ -126,63 +152,85 @@ class GPT2AttentionAdapter(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
-        past_key_values: Optional[Tuple[torch.Tensor, ...]] = None,
+        past_key_values=None,
+        cache_position: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
         """Forward pass with GPT-2 compatible signature.
 
-        GPT-2 uses (key, value) tuple for layer_past, but we store (c_kv,).
-        Newer transformers versions use past_key_values instead of layer_past.
+        Supports both legacy tuple caches and transformers >=5.x DynamicCache.
         """
-        # Handle both old (layer_past) and new (past_key_values) API
-        past = layer_past if layer_past is not None else past_key_values
+        # --- Extract c_kv from cache (if any) ---
+        mla_past = None
+        cache_obj = None  # DynamicCache reference for update
 
-        # Convert GPT-2's past format
-        if past is not None:
-            # past might be in old format (key, value) or our format (c_kv,)
-            if isinstance(past, tuple) and len(past) == 2:
-                # Check if it's our format - c_kv would have d_latent as last dim
-                if past[0].shape[-1] == self.mla.mla_compression.d_latent:
-                    # Our format stored as (c_kv, None) for compatibility
-                    past_key_value = (past[0],)
-                else:
-                    # Old format (key, value) - start fresh
-                    past_key_value = None
-            elif isinstance(past, tuple) and len(past) == 1:
-                # Our format (c_kv,)
-                past_key_value = past
-            else:
-                past_key_value = None
-        else:
-            past_key_value = None
+        # Prefer DynamicCache (transformers >=5.x)
+        past = layer_past if layer_past is not None else past_key_values
+        if past is not None and hasattr(past, "update"):
+            # DynamicCache path
+            cache_obj = past
+            try:
+                # DynamicCache stores per-layer; check if our layer has data
+                seq_len = 0
+                if hasattr(past, "get_seq_length"):
+                    try:
+                        seq_len = past.get_seq_length(self.layer_idx)
+                    except TypeError:
+                        seq_len = past.get_seq_length()
+                if seq_len > 0:
+                    # Retrieve stored key+value tensors and reconstruct c_kv
+                    cached_key = None
+                    cached_val = None
+                    if hasattr(past, "key_cache") and self.layer_idx < len(past.key_cache):
+                        cached_key = past.key_cache[self.layer_idx]
+                        if hasattr(past, "value_cache") and self.layer_idx < len(past.value_cache):
+                            cached_val = past.value_cache[self.layer_idx]
+                    elif hasattr(past, "layers") and self.layer_idx < len(past.layers):
+                        cached_key = past.layers[self.layer_idx].keys
+                        cached_val = past.layers[self.layer_idx].values
+
+                    if cached_key is not None and cached_key.numel() > 0:
+                        c_kv = self._cache_to_c_kv(cached_key, cached_val)
+                        mla_past = (c_kv,)
+            except (IndexError, AttributeError):
+                # Cache structure/layout not as expected; treat as no past available
+                mla_past = None
+        elif past is not None:
+            # Legacy tuple path
+            if isinstance(past, tuple) and len(past) >= 1:
+                t = past[0]
+                if isinstance(t, torch.Tensor):
+                    expected_dim = 2 * self._cache_d_latent
+                    if t.dim() == 3 and t.shape[-1] == expected_dim:
+                        mla_past = (t,)
+                    elif t.dim() == 4 and t.shape[-1] == expected_dim:
+                        mla_past = (self._cache_to_c_kv(t),)
 
         # Handle GPT-2's attention mask format
         # GPT-2 uses (batch, 1, 1, seq) with 0 for attend, large negative for mask
         if attention_mask is not None and attention_mask.dim() == 4:
-            # Already in GPT-2 format, convert to additive mask
-            # GPT-2 mask: 0 = attend, -10000 = mask
             pass  # Keep as is, it's already additive
 
         # Call MLA attention
         attn_output, new_past, attn_weights = self.mla(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            past_key_value=past_key_value,
+            past_key_value=mla_past,
             use_cache=use_cache,
             output_attentions=output_attentions,
         )
 
-        # Format output as GPT-2 expects
-        # GPT-2 expects (attn_output, present) where present is (key, value) tuple
-        # We return (c_kv, c_kv) to maintain tuple structure (both same for compatibility)
-        outputs = (attn_output,)
-        if use_cache and new_past is not None:
-            # Return as (c_kv, c_kv) tuple for GPT-2 compatibility
-            outputs = outputs + ((new_past[0], new_past[0]),)
-        if output_attentions:
-            outputs = outputs + (attn_weights,)
+        # --- Store c_kv back into DynamicCache ---
+        if use_cache and new_past is not None and cache_obj is not None:
+            c_kv_full = new_past[0]  # (batch, full_seq, dim)
+            # Only store the NEW tokens (DynamicCache accumulates)
+            past_seq_len = mla_past[0].shape[1] if mla_past is not None else 0
+            c_kv_new = c_kv_full[:, past_seq_len:, :]
+            keys, values = self._c_kv_to_cache_format(c_kv_new)
+            cache_obj.update(keys, values, self.layer_idx, {"cache_position": cache_position})
 
-        return outputs
+        # Return (attn_output, attn_weights) — transformers >=5.x signature
+        return attn_output, attn_weights
 
     def check_orthonormality(self):
         """Delegate to MLA attention."""

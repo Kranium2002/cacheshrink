@@ -19,6 +19,7 @@ Achieve **2-16x KV cache compression** on LLaMA, Mistral, Qwen, GPT-2, and other
   - [Fine-tuning with Knowledge Distillation](#fine-tuning-with-knowledge-distillation)
   - [Evaluation](#evaluation)
   - [Saving and Loading](#saving-and-loading)
+    - [Reducing Saved Model Size](#reducing-saved-model-size)
 - [Parameter Reference](#parameter-reference)
 - [Training Details](#training-details)
 - [Benchmark Results](#benchmark-results)
@@ -386,6 +387,36 @@ model, tokenizer = load_mla_model("./my-compressed-model", device="cuda", dtype=
 
 Saved files include the model weights, tokenizer, MLA config, and xKV group state (if applicable). Shared tensor references (xKV's shared W_uk/W_uv) are correctly preserved through save/load.
 
+#### Reducing Saved Model Size
+
+By default, `save_mla_model` excludes training buffers (W_k_original, W_v_original) from the saved checkpoint. These buffers store the original K/V projection weights used only for reconstruction loss during training. Excluding them significantly reduces saved model size:
+
+| Model | With Training Buffers | Without (default) | Saved |
+|-------|----------------------|-------------------|-------|
+| LLaMA-2 7B (16x) | ~14.5 GB | ~12.5 GB | ~2 GB |
+| Qwen2.5-7B (2x) | ~15.2 GB | ~15.0 GB | ~200 MB |
+
+If you need to resume training with reconstruction loss later, save with buffers explicitly:
+
+```python
+# For distribution/inference (default) — smallest size
+save_mla_model(model, tokenizer, "./my-model")
+
+# To resume reconstruction-loss training later — includes original K/V weights
+save_mla_model(model, tokenizer, "./my-model-resumable", save_training_buffers=True)
+```
+
+At load time, training buffers are also skipped by default — both via `load_mla_model()` and `AutoModelForCausalLM.from_pretrained()`:
+
+```python
+# Inference (default) — skips training buffers, lower GPU memory
+model, tokenizer = load_mla_model("./my-model", device="cuda", dtype=torch.bfloat16)
+
+# Resume training — loads training buffers
+model, tokenizer = load_mla_model("./my-model-resumable", device="cuda", dtype=torch.bfloat16,
+                                   load_training_buffers=True)
+```
+
 ## Parameter Reference
 
 ### `convert_to_mla()`
@@ -403,7 +434,7 @@ Saved files include the model weights, tokenizer, MLA config, and xKV group stat
 | `calibration_dataset_subset` | str | `"wikitext-2-raw-v1"` | Dataset subset name (second arg to `load_dataset()`) |
 | `num_calibration_samples` | int | 128 | Number of calibration samples (more = better init) |
 | `max_calibration_length` | int | 512 | Max sequence length for calibration |
-| `store_original_weights` | bool | False | Store W_k/W_v for reconstruction loss training |
+| `store_original_weights` | bool | False | Store W_k/W_v for reconstruction loss training (required for `use_reconstruction_loss`) |
 | `cross_layer_group_size` | int | 4 | Layers per xKV group (xKV only) |
 | `xkv_skip_early_layers` | int | 0 | Number of early layers to exclude from xKV (xKV only) |
 | `keep_early_layers_original` | bool | False | Keep skipped layers as original attention (xKV only) |
@@ -432,6 +463,28 @@ Saved files include the model weights, tokenizer, MLA config, and xKV group stat
 | `num_epochs` | int | 3 | Number of training epochs |
 | `batch_size` | int | 4 | Training batch size |
 | `max_length` | int | 512 | Maximum sequence length |
+
+### `save_mla_model()`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | nn.Module | *required* | MLA-converted model |
+| `tokenizer` | Tokenizer | *required* | HuggingFace tokenizer |
+| `save_directory` | str | *required* | Directory to save to |
+| `training_stats` | dict | None | Optional training statistics to save |
+| `use_safetensors` | bool | True | Use safetensors format (recommended) |
+| `enable_hf_loading` | bool | True | Enable `AutoModelForCausalLM.from_pretrained()` support |
+| `save_training_buffers` | bool | False | Save W_k_original/W_v_original. Set True only to resume reconstruction-loss training. |
+
+### `load_mla_model()`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `load_directory` | str | *required* | Directory containing saved model |
+| `device` | str | None | Device to load model to (e.g., `"cuda"`) |
+| `dtype` | torch.dtype | None | Model dtype (e.g., `torch.bfloat16`) |
+| `low_cpu_mem_usage` | bool | True | Use accelerate-style loading for lower peak memory |
+| `load_training_buffers` | bool | False | Load W_k_original/W_v_original. Set True only to resume reconstruction-loss training. |
 
 ## Training Details
 

@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 
 from .config import MLAConfig
+from .utils import robust_svd
 from .xkv_compression import XKVCompressionGroup
 
 
@@ -212,8 +213,8 @@ def _compute_shared_basis_from_activations(
     # SVD on transposed stacked K/V to find shared basis
     # K_all.T: (d_kv, group_size * n_tokens)
     # We want U: (d_kv, d_latent) - columns are basis vectors
-    U_k, S_k, _ = torch.linalg.svd(K_all.T, full_matrices=False)
-    U_v, S_v, _ = torch.linalg.svd(V_all.T, full_matrices=False)
+    U_k, S_k, _ = robust_svd(K_all.T, full_matrices=False)
+    U_v, S_v, _ = robust_svd(V_all.T, full_matrices=False)
 
     # Truncate to d_latent
     shared_W_uk = U_k[:, :d_latent]  # (d_kv, d_latent)
@@ -249,8 +250,8 @@ def _compute_shared_basis_from_weights(
     W_v_all = torch.cat([W.float() for W in W_v_list], dim=0)
 
     # SVD to find shared structure
-    U_k, S_k, _ = torch.linalg.svd(W_k_all, full_matrices=False)
-    U_v, S_v, _ = torch.linalg.svd(W_v_all, full_matrices=False)
+    U_k, S_k, _ = robust_svd(W_k_all, full_matrices=False)
+    U_v, S_v, _ = robust_svd(W_v_all, full_matrices=False)
 
     # Reshape U to get per-KV-dimension basis
     # U_k: (group_size * d_kv, min(group_size * d_kv, d_model))
@@ -270,8 +271,8 @@ def _compute_shared_basis_from_weights(
     U_v_avg = U_v_reshaped.mean(dim=0)
 
     # SVD on averaged basis to get orthonormal columns
-    U_k_final, S_k_final, _ = torch.linalg.svd(U_k_avg, full_matrices=False)
-    U_v_final, S_v_final, _ = torch.linalg.svd(U_v_avg, full_matrices=False)
+    U_k_final, S_k_final, _ = robust_svd(U_k_avg, full_matrices=False)
+    U_v_final, S_v_final, _ = robust_svd(U_v_avg, full_matrices=False)
 
     shared_W_uk = U_k_final[:, :d_latent]
     shared_W_uv = U_v_final[:, :d_latent]
