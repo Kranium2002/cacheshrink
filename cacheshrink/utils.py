@@ -25,25 +25,29 @@ def robust_svd(
     # Attempt 1: standard SVD
     try:
         return torch.linalg.svd(M, full_matrices=full_matrices)
-    except torch._C._LinAlgError:
+    except torch.linalg.LinAlgError:
         logger.warning("Standard SVD failed, retrying with jitter regularization")
 
     # Attempt 2: add small jitter and retry
     try:
         jitter = 1e-6 * torch.randn_like(M)
         return torch.linalg.svd(M + jitter, full_matrices=full_matrices)
-    except torch._C._LinAlgError:
+    except torch.linalg.LinAlgError:
         logger.warning("Jittered SVD failed, retrying with gesvd driver")
 
     # Attempt 3: use gesvd driver (more robust but slower)
     try:
         return torch.linalg.svd(M, full_matrices=full_matrices, driver="gesvd")
-    except (torch._C._LinAlgError, RuntimeError):
+    except (torch.linalg.LinAlgError, RuntimeError):
         logger.warning("gesvd driver failed, falling back to randomized SVD")
 
     # Attempt 4: randomized SVD via torch.svd_lowrank
+    # Cap rank to avoid expensive full-rank decomposition on large matrices
     k = min(M.shape)
-    U, S, V = torch.svd_lowrank(M, q=k)
+    q = min(k, 512)
+    if q < k:
+        logger.info(f"Randomized SVD fallback using truncated rank {q} instead of full rank {k}")
+    U, S, V = torch.svd_lowrank(M, q=q)
     # torch.svd_lowrank returns (U, S, V) where V is already transposed
     # compared to torch.linalg.svd which returns Vh
     Vh = V.T
@@ -115,10 +119,10 @@ def orthonormalize_columns(
         # Skip check on meta tensors (used during model skeleton creation)
         if sv_clamp_min > 0 and not W.is_meta:
             if S.min() < sv_clamp_min:
-                n_clamped = (S < sv_clamp_min).sum().item()
-                logger.info(
-                    f"Clamped {n_clamped} singular value(s) below {sv_clamp_min} "
-                    f"(min was {S.min().item():.2e})"
+                n_small = (S < sv_clamp_min).sum().item()
+                logger.warning(
+                    f"Found {n_small} singular value(s) below {sv_clamp_min} "
+                    f"(min was {S.min().item():.2e}); matrix may be ill-conditioned"
                 )
         return U @ Vh
 

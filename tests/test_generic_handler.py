@@ -376,6 +376,7 @@ class TestGenericAttentionAdapter:
         assert output[0].shape == (batch_size, seq_len, generic_config_no_rope.d_model)
 
     def test_forward_with_use_cache(self, generic_config):
+        pytest.importorskip("transformers.cache_utils")
         from transformers.cache_utils import DynamicCache
 
         mla = MLAAttention(generic_config, layer_idx=0)

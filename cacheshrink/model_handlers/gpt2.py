@@ -109,8 +109,8 @@ class GPT2AttentionAdapter(nn.Module):
     In transformers >=5.x, GPT-2 passes a DynamicCache object and expects the
     attention module to call cache.update() internally. The return signature is
     (attn_output, attn_weights). We store the compressed c_kv latent inside
-    DynamicCache by packing it as a fake (1, 1, seq, d_latent*2) key tensor
-    with a zero-valued value tensor of the same shape.
+    DynamicCache by splitting c_kv into (c_k, c_v) along the last dimension and
+    storing them as separate key and value tensors of shape (batch, 1, seq, d_latent).
     """
 
     def __init__(self, mla_attention: nn.Module):
@@ -171,7 +171,13 @@ class GPT2AttentionAdapter(nn.Module):
             cache_obj = past
             try:
                 # DynamicCache stores per-layer; check if our layer has data
-                if hasattr(past, "get_seq_length") and past.get_seq_length(self.layer_idx) > 0:
+                seq_len = 0
+                if hasattr(past, "get_seq_length"):
+                    try:
+                        seq_len = past.get_seq_length(self.layer_idx)
+                    except TypeError:
+                        seq_len = past.get_seq_length()
+                if seq_len > 0:
                     # Retrieve stored key+value tensors and reconstruct c_kv
                     cached_key = None
                     cached_val = None
@@ -187,7 +193,8 @@ class GPT2AttentionAdapter(nn.Module):
                         c_kv = self._cache_to_c_kv(cached_key, cached_val)
                         mla_past = (c_kv,)
             except (IndexError, AttributeError):
-                pass
+                # Cache structure/layout not as expected; treat as no past available
+                mla_past = None
         elif past is not None:
             # Legacy tuple path
             if isinstance(past, tuple) and len(past) >= 1:
@@ -204,17 +211,17 @@ class GPT2AttentionAdapter(nn.Module):
         if attention_mask is not None and attention_mask.dim() == 4:
             pass  # Keep as is, it's already additive
 
-        # Call MLA attention — always request cache so we can store it
+        # Call MLA attention
         attn_output, new_past, attn_weights = self.mla(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             past_key_value=mla_past,
-            use_cache=True,
+            use_cache=use_cache,
             output_attentions=output_attentions,
         )
 
         # --- Store c_kv back into DynamicCache ---
-        if new_past is not None and cache_obj is not None:
+        if use_cache and new_past is not None and cache_obj is not None:
             c_kv_full = new_past[0]  # (batch, full_seq, dim)
             # Only store the NEW tokens (DynamicCache accumulates)
             past_seq_len = mla_past[0].shape[1] if mla_past is not None else 0

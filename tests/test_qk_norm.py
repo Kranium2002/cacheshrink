@@ -1,8 +1,6 @@
 """Tests for QK norm support (Qwen3-style qk_norm=True)."""
 
-import pytest
 import torch
-import torch.nn as nn
 
 from cacheshrink.attention import RMSNorm, MLAAttention
 from cacheshrink.config import MLAConfig

@@ -175,6 +175,12 @@ def save_mla_model(
 
         for group_idx, group in model.xkv_groups.items():
             group_state = group.state_dict()
+            # Apply same training buffer filter to xKV groups
+            if not save_training_buffers:
+                group_state = {
+                    k: v for k, v in group_state.items()
+                    if not k.endswith("W_k_original") and not k.endswith("W_v_original")
+                }
             for key, value in group_state.items():
                 if isinstance(value, torch.Tensor):
                     tensor = value.contiguous().cpu()

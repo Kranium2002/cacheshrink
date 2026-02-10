@@ -414,6 +414,7 @@ class GenericAttentionAdapter(nn.Module):
             past_key_value=mla_past,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            position_embeddings=position_embeddings,
         )
 
         # Store c_kv back into DynamicCache in-place

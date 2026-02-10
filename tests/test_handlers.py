@@ -101,6 +101,7 @@ class TestGPT2AttentionAdapter:
 
     def test_forward_with_cache(self, gpt2_config, device, dtype):
         """Test adapter with caching via DynamicCache (transformers >=5.x)."""
+        pytest.importorskip("transformers.cache_utils")
         from transformers.cache_utils import DynamicCache
         from cacheshrink.attention import MLAAttention
         from cacheshrink.model_handlers.gpt2 import GPT2AttentionAdapter
